@@ -3,6 +3,7 @@
 // names, no serial numbers, not even the file's name: only categories, so
 // sharing the card cannot leak what the file did.
 import type { FileModel } from "./model";
+import { canShareData } from "./files";
 import { categories } from "./fact-categories";
 import { list } from "./list-format";
 export { CATEGORIES, categoryCount, categories } from "./fact-categories";
@@ -16,6 +17,10 @@ function noun(m: FileModel): string {
       return "image";
     case "video":
       return "video";
+    case "mp3":
+    case "flac":
+    case "ogg":
+      return "audio file";
     case "eml":
     case "msg":
       return "email";
@@ -92,7 +97,7 @@ export async function share(m: FileModel): Promise<string> {
   const blob = await card(m);
   const file = blob ? new File([blob], "hexscope-found.png", { type: "image/png" }) : null;
   const data: ShareData = file ? { files: [file], text } : { text };
-  if (navigator.canShare?.(data)) {
+  if (canShareData(data)) {
     try {
       await navigator.share(data);
       return "Shared.";
