@@ -1,6 +1,7 @@
 import { HEX, MONO, themeColors } from "./canvas";
 import { onThemeChange } from "./theme";
 import { FileModel, Kind, type Tint } from "./model";
+import { reportViewRange, type ReportedViewRange, type ViewRangeListener } from "./view-range";
 
 export interface HexCallbacks {
   onHover(id: number, offset: number, keyboard?: boolean): void;
@@ -19,6 +20,10 @@ const PAD_X = 20;
 const NARROW_PAD_X = 8;
 /** How long a flash takes to fade, in milliseconds. */
 const FLASH_MS = 700;
+/** A held touch briefly reveals the byte under it without selecting it. */
+const TOUCH_PEEK_MS = 500;
+/** Movement beyond this distance is a scroll or swipe, not a peek. */
+const TOUCH_PEEK_MOVE_PX = 12;
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 const PAD_Y = 14;
 /** Browsers cap element height; past this the scrollbar maps proportionally. */
@@ -79,6 +84,7 @@ export class HexView {
   /** Exact byte the keyboard cursor is on; the selected part may span many. */
   private focusOffset = -1;
   private keyboardActive = false;
+  private reportedView: ReportedViewRange | null = null;
   /** Bytes flashing to show where something just led, and when it began. */
   private flashing: { start: number; end: number; t0: number } | null = null;
   /** Bytes the DEFLATE player is reading right now, as [start, end). */
@@ -96,8 +102,30 @@ export class HexView {
   private left = 0;
   /** Hex digits in the offset column: enough for the file, at least six. */
   private offsetDigits = 8;
-  /** Told the byte range on screen after every draw, e.g. by the minimap. */
-  onView: ((start: number, end: number) => void) | null = null;
+  /** The listener that receives the current visible byte range. */
+  private onViewListener: ViewRangeListener | null = null;
+  /** Pending or completed touch gesture used to reveal a byte without pinning it. */
+  private touchPeek: {
+    pointerId: number;
+    x: number;
+    y: number;
+    timer: number;
+    peeked: boolean;
+    moved: boolean;
+  } | null = null;
+  private suppressTouchClick = false;
+  private lastTouchPeek = false;
+
+  get onView(): ViewRangeListener | null {
+    return this.onViewListener;
+  }
+
+  set onView(listener: ViewRangeListener | null) {
+    if (listener === this.onViewListener) return;
+    this.onViewListener = listener;
+    this.reportedView = null;
+    this.schedule();
+  }
 
   constructor(
     host: HTMLElement,
@@ -125,6 +153,15 @@ export class HexView {
     this.ctx = ctx;
 
     new ResizeObserver(() => this.resize()).observe(this.scroller);
+    this.bindScrollerEvents();
+    this.bindCanvasEvents();
+    onThemeChange(() => {
+      this.palette = readPalette();
+      this.schedule();
+    });
+  }
+
+  private bindScrollerEvents(): void {
     this.scroller.addEventListener("scroll", () => this.schedule(), { passive: true });
     this.scroller.addEventListener("keydown", (e) => this.keydown(e));
     this.scroller.addEventListener("focus", () => this.schedule());
@@ -132,26 +169,58 @@ export class HexView {
       this.keyboardActive = false;
       this.schedule();
     });
-    this.canvas.addEventListener("mousemove", (e) => this.pointer(e, false));
-    this.canvas.addEventListener("mouseleave", () => this.cb.onHover(-1, -1));
-    this.canvas.addEventListener("pointerdown", () => {
+  }
+
+  private bindCanvasEvents(): void {
+    this.canvas.addEventListener("mouseleave", () => {
+      if (!this.lastTouchPeek) this.cb.onHover(-1, -1);
+    });
+    this.canvas.addEventListener("pointerdown", (e) => {
+      this.clearTouchPeek();
+      this.suppressTouchClick = false;
+      if (this.lastTouchPeek) this.cb.onHover(-1, -1);
+      this.lastTouchPeek = false;
       this.keyboardActive = false;
       this.scroller.focus({ preventScroll: true });
       this.schedule();
+      if (e.pointerType === "touch") this.startTouchPeek(e);
     });
-    this.canvas.addEventListener("click", (e) => this.pointer(e, true));
-    onThemeChange(() => {
-      this.palette = readPalette();
-      this.schedule();
+    this.canvas.addEventListener("pointermove", (e) => {
+      if (e.pointerType === "touch") {
+        this.moveTouchPeek(e);
+        return;
+      }
+      this.lastTouchPeek = false;
+      this.pointer(e, false);
+    });
+    this.canvas.addEventListener("pointerup", (e) => this.endTouchPeek(e, false));
+    this.canvas.addEventListener("pointercancel", (e) => this.endTouchPeek(e, true));
+    this.canvas.addEventListener("click", (e) => {
+      const pointerType = "pointerType" in e ? e.pointerType : "";
+      const touchClick = pointerType === "touch" || (!pointerType && e.detail > 0);
+      if (this.suppressTouchClick && touchClick) {
+        this.suppressTouchClick = false;
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (touchClick) this.suppressTouchClick = false;
+      this.lastTouchPeek = false;
+      this.pointer(e, true);
     });
   }
 
   setModel(model: FileModel | null): void {
+    const cancelledTouch = this.touchPeek !== null;
+    this.clearTouchPeek();
+    this.suppressTouchClick ||= cancelledTouch;
+    this.lastTouchPeek = false;
     this.model = model;
     this.hover = -1;
     this.selected = -1;
     this.focusOffset = -1;
     this.keyboardActive = false;
+    this.reportedView = null;
     this.head = [-1, -1];
     this.offsetDigits = Math.max(6, (model?.bytes.length ?? 0).toString(16).length);
     this.scroller.scrollTop = 0;
@@ -367,6 +436,58 @@ export class HexView {
     if (hadKeyboardCursor) this.schedule();
   }
 
+  private startTouchPeek(e: PointerEvent): void {
+    const gesture = {
+      pointerId: e.pointerId,
+      x: e.clientX,
+      y: e.clientY,
+      timer: 0,
+      peeked: false,
+      moved: false,
+    };
+    gesture.timer = window.setTimeout(() => {
+      if (this.touchPeek !== gesture || gesture.moved) return;
+      gesture.peeked = true;
+      this.lastTouchPeek = true;
+      this.pointer(e, false);
+    }, TOUCH_PEEK_MS);
+    this.touchPeek = gesture;
+  }
+
+  private moveTouchPeek(e: PointerEvent): void {
+    const gesture = this.touchPeek;
+    if (!gesture || e.pointerType !== "touch" || gesture.pointerId !== e.pointerId || gesture.moved) return;
+    if (Math.hypot(e.clientX - gesture.x, e.clientY - gesture.y) < TOUCH_PEEK_MOVE_PX) return;
+
+    gesture.moved = true;
+    window.clearTimeout(gesture.timer);
+    if (gesture.peeked) {
+      this.cb.onHover(-1, -1);
+      this.lastTouchPeek = false;
+    }
+  }
+
+  private endTouchPeek(e: PointerEvent, cancelled: boolean): void {
+    const gesture = this.touchPeek;
+    if (!gesture || gesture.pointerId !== e.pointerId) return;
+    window.clearTimeout(gesture.timer);
+    this.touchPeek = null;
+    if (cancelled) {
+      if (gesture.peeked) {
+        this.cb.onHover(-1, -1);
+        this.lastTouchPeek = false;
+      }
+      this.suppressTouchClick = true;
+      return;
+    }
+    this.suppressTouchClick = gesture.peeked || gesture.moved;
+  }
+
+  private clearTouchPeek(): void {
+    if (this.touchPeek) window.clearTimeout(this.touchPeek.timer);
+    this.touchPeek = null;
+  }
+
   private keydown(e: KeyboardEvent): void {
     const m = this.model;
     if (!m || m.bytes.length === 0 || e.altKey || e.ctrlKey || e.metaKey) return;
@@ -427,7 +548,9 @@ export class HexView {
     ctx.fillRect(0, 0, this.viewW, this.viewH);
     const m = this.model;
     if (!m) return;
-    this.onView?.(...this.visibleRange());
+    if (this.onViewListener) {
+      this.reportedView = reportViewRange(this.reportedView, this.visibleRange(), this.onViewListener);
+    }
 
     ctx.font = `${this.fontPx}px ${MONO}`;
     ctx.textBaseline = "middle";

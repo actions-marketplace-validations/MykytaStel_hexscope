@@ -9,6 +9,12 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+fn zip_fixture() -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../apps/web/public/samples/deflate-demo.zip");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
 #[cfg(feature = "audio")]
 #[test]
 fn audio_metadata_and_incomplete_status_cross_the_wasm_boundary() {
@@ -43,6 +49,58 @@ fn every_array_describes_every_node() {
     assert_eq!(parsed.labels.split(SEPARATOR).count(), n);
     assert_eq!(parsed.values.split(SEPARATOR).count(), n);
     assert_eq!(parsed.parents[0], -1, "node 0 is the root");
+}
+
+#[test]
+fn retaining_owned_source_reuses_its_allocation() {
+    let source = vec![0xA5; 1024 * 1024];
+    let allocation = source.as_ptr();
+
+    let retained = SourceBytes::Owned(source).retain();
+
+    assert_eq!(retained.as_ptr(), allocation);
+    assert_eq!(retained.len(), 1024 * 1024);
+}
+
+#[test]
+fn an_external_zip_opens_and_plays_from_only_the_requested_entry_range() {
+    let source = zip_fixture();
+    let mut parsed = parse_owned_external(source.clone());
+    assert_eq!(parsed.format, "zip");
+
+    // The metadata remains in WASM, but the archive's full bytes do not.
+    assert!(parsed.extract_entry(0).is_empty());
+    assert!(parsed.extract_error().contains("range"));
+
+    let range = parsed.entry_data_range(0);
+    assert_eq!(range.len(), 2);
+    let start = range[0] as usize;
+    let end = start + range[1] as usize;
+    let compressed = source[start..end].to_vec();
+    let expected = concat!(
+        "A byte is a byte, and a bit is a bit.\n",
+        "Eight bits make a byte, and bytes make a file.\n",
+        "A file that says the same thing twice\n",
+        "need not say the same thing twice:\n",
+        "it can say it once, then point back to it.\n\n",
+        "Point back four bytes, copy four bytes.\n",
+        "Point back forty bytes, copy forty bytes.\n",
+        "Point back to a word you have seen before,\n",
+        "and the word you have seen before costs almost nothing.\n\n",
+        "Letters you use often get short codes;\n",
+        "letters you use rarely get long codes.\n",
+        "Short codes for often, long codes for rarely:\n",
+        "that is how a file that says the same thing twice\n",
+        "becomes a file that says it once.\n",
+    );
+    assert_eq!(
+        parsed.extract_entry_from(0, compressed.clone()),
+        expected.as_bytes()
+    );
+    assert!(parsed.select_entry_from(0, compressed));
+    assert!(parsed.trace()[0] > 0.0);
+    assert_eq!(parsed.inflated(), expected.as_bytes());
+    assert_eq!(parsed.segments(), range);
 }
 
 #[test]
@@ -343,6 +401,34 @@ fn a_photo_says_where_its_blocks_are() {
 }
 
 #[test]
+fn owned_jpeg_parse_keeps_the_source_for_its_lazy_block_map() {
+    let photo = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/web/public/samples/photo.jpg"),
+    )
+    .unwrap();
+    let expected = parse(&photo).block_map();
+
+    let mut parsed = parse_owned(photo);
+
+    assert_eq!(parsed.block_map(), expected);
+    assert_eq!(parsed.blocks_note(), "");
+}
+
+#[test]
+fn external_parse_keeps_a_jpeg_source_for_its_lazy_block_map() {
+    let photo = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/web/public/samples/photo.jpg"),
+    )
+    .unwrap();
+    let expected = parse(&photo).block_map();
+
+    let mut parsed = parse_owned_external(photo);
+
+    assert_eq!(parsed.block_map(), expected);
+    assert_eq!(parsed.blocks_note(), "");
+}
+
+#[test]
 fn an_interlaced_png_has_a_picture_and_every_pass_row_filter() {
     let png = std::fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -623,7 +709,7 @@ fn what_cannot_be_played_is_refused() {
 #[test]
 fn an_entry_opens_as_a_file_of_its_own() {
     let bytes = docx("../../apps/web/public/samples/report.docx");
-    let mut parsed = parse(&bytes);
+    let mut parsed = parse_owned(bytes);
     let entries = parsed.entries();
     let n = entries.len() / ENTRY_STRIDE;
     let photo = (0..n)

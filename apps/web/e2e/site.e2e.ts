@@ -30,10 +30,199 @@ async function home(page: Page): Promise<void> {
   await page.waitForFunction(() => document.body.dataset.state === "empty");
 }
 
+async function analyzerChunksLoaded(page: Page): Promise<string[]> {
+  return page.evaluate(() =>
+    performance.getEntriesByType("resource").map(({ name }) => name).filter((name) => name.includes("/assets/analyzer-") && name.endsWith(".js")),
+  );
+}
+
 /** Use the shared workspace navigation on desktop and phone. */
 async function openBytes(page: Page): Promise<void> {
   await openView(page, "bytes");
 }
+
+test.describe("DEFLATE player loading", () => {
+  test.use({ serviceWorkers: "block" });
+
+  test("loads the player only when playback is requested", async ({ page }, info) => {
+    test.skip(info.project.name !== "computer", "the script request check runs on the computer project");
+    const scripts: string[] = [];
+    page.on("request", (request) => {
+      if (request.resourceType() === "script") scripts.push(request.url());
+    });
+
+    await page.goto("./?sample=photo.jpg");
+    await expect(page.locator(".verdict-title")).toBeVisible();
+    await page.waitForLoadState("networkidle");
+    expect(scripts.some((url) => /\/player-[\w-]+\.js$/.test(url))).toBe(false);
+
+    await page.goto("./?sample=sample.png");
+    await expect(page.locator(".drawer-player")).toBeVisible();
+    expect(scripts.some((url) => /\/player-[\w-]+\.js$/.test(url))).toBe(true);
+  });
+
+  test("keeps the file open and allows retry when the player chunk fails", async ({ page }, info) => {
+    await page.addInitScript(() => localStorage.setItem("hexscope.language", "uk"));
+    let failNext = true;
+    await page.route("**/player-*.js", (route) => {
+      if (failNext) {
+        failNext = false;
+        return route.abort();
+      }
+      return route.continue();
+    });
+
+    await page.goto("./?sample=sample.png");
+    await expect(page.locator(".verdict-title")).toBeVisible();
+    const error = page.locator("#player-load-error");
+    await expect(error).toBeVisible();
+    await expect(error).toContainText("Не вдалося завантажити плеєр стиснення. Спробуйте ще раз.");
+    await expect(error.getByRole("button", { name: "Спробувати ще раз" })).toBeVisible();
+    await expect(page.locator(".drawer-player")).toHaveCount(0);
+    if (info.project.name === "phone") {
+      await page.setViewportSize({ width: 320, height: 700 });
+      await expect(error).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      const messageLayout = await error.locator(".player-load-error-message").evaluate((message) => {
+        const text = message as HTMLElement;
+        const retry = document.querySelector<HTMLElement>("#player-load-error [data-retry-player]")!;
+        const messageRect = text.getBoundingClientRect();
+        const retryRect = retry.getBoundingClientRect();
+        return { scrollWidth: text.scrollWidth, clientWidth: text.clientWidth, messageBottom: messageRect.bottom, retryTop: retryRect.top };
+      });
+      expect(messageLayout.scrollWidth).toBeLessThanOrEqual(messageLayout.clientWidth);
+      expect(messageLayout.messageBottom).toBeLessThanOrEqual(messageLayout.retryTop);
+    }
+
+    await error.locator("[data-retry-player]").click();
+    await expect(error).toBeHidden();
+    await expect(page.locator(".drawer-player")).toBeVisible();
+    await page.locator(".player-close").click();
+    await expect(error).toBeHidden();
+    await expect(page.locator(".drawer-node .problem")).toHaveCount(0);
+  });
+
+  test("retry resumes the picture step that was requested", async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem("hexscope.language", "en");
+      localStorage.setItem("hexscope.tour", "done");
+    });
+    let requests = 0;
+    await page.route("**/player-*.js", async (route) => {
+      requests++;
+      if (requests === 1) await route.abort();
+      else await route.continue();
+    });
+
+    await page.goto("./");
+    await page.locator("#picker-empty").setInputFiles(new URL("../public/samples/sample.png", import.meta.url).pathname);
+    await expect(page.locator(".verdict-title")).toBeVisible();
+    await page.locator(".more-details > summary").click();
+    const picture = page.locator(".picture-frame");
+    await expect(picture).toBeVisible();
+    const bounds = await picture.boundingBox();
+    expect(bounds).not.toBeNull();
+    await picture.click({ position: { x: bounds!.width * 0.75, y: bounds!.height * 0.75 } });
+
+    const step = page.locator(".picture-caption").getByRole("button", { name: /^Step [\d,]+ in the player$/ });
+    await expect(step).toBeVisible();
+    const label = await step.innerText();
+    const requestedStep = Number(label.match(/Step ([\d,]+)/)?.[1].replaceAll(",", ""));
+    expect(requestedStep).toBeGreaterThan(1);
+    await step.click();
+    const error = page.locator("#player-load-error");
+    await expect(error).toBeVisible();
+    expect(requests).toBe(1);
+
+    await error.locator("[data-retry-player]").click();
+    await expect.poll(() => requests).toBe(2);
+    await expect(page.locator(".drawer-player")).toBeVisible();
+    await expect(page.locator(".player-counter")).toContainText(`Step ${requestedStep} of`);
+  });
+
+  test("does not reopen playback after its file is replaced during a chunk load", async ({ page }, info) => {
+    test.skip(info.project.name !== "computer", "the pending chunk replacement route runs on the computer project");
+    let intercepted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    await page.route("**/player-*.js", async (route) => {
+      intercepted = true;
+      await gate;
+      await route.continue();
+    });
+
+    let response: Promise<unknown> | null = null;
+    try {
+      await page.goto("./?sample=sample.png");
+      await expect.poll(() => intercepted).toBe(true);
+      await page.locator("#picker").setInputFiles(new URL("../public/samples/photo.jpg", import.meta.url).pathname);
+      await expect(page.locator(".filename")).toContainText("photo.jpg");
+      response = page.waitForResponse((r) => /\/player-[\w-]+\.js$/.test(r.url()));
+    } finally {
+      release();
+    }
+
+    await response;
+    await page.waitForLoadState("networkidle");
+    await expect(page.locator("body")).not.toHaveClass(/is-playing/);
+    await expect(page.locator(".drawer-player")).toHaveCount(0);
+  });
+
+  test("Escape cancels a pending player import", async ({ page }, info) => {
+    test.skip(info.project.name !== "computer", "the pending player import route runs on the computer project");
+    let intercepted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    await page.route("**/player-*.js", async (route) => {
+      intercepted = true;
+      await gate;
+      await route.continue();
+    });
+
+    let response: Promise<unknown> | null = null;
+    try {
+      await page.goto("./?sample=sample.png");
+      await expect.poll(() => intercepted).toBe(true);
+      await page.keyboard.press("Escape");
+      response = page.waitForResponse((r) => /\/player-[\w-]+\.js$/.test(r.url()));
+    } finally {
+      release();
+    }
+
+    await response;
+    await page.waitForLoadState("networkidle");
+    await expect(page.locator("body")).not.toHaveClass(/is-playing/);
+    await expect(page.locator(".drawer-player")).toHaveCount(0);
+  });
+
+  test("changing the workspace view cancels a pending player import", async ({ page }, info) => {
+    test.skip(info.project.name !== "computer", "the pending player import route runs on the computer project");
+    let intercepted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    await page.route("**/player-*.js", async (route) => {
+      intercepted = true;
+      await gate;
+      await route.continue();
+    });
+
+    let response: Promise<unknown> | null = null;
+    try {
+      await page.goto("./?sample=sample.png");
+      await expect.poll(() => intercepted).toBe(true);
+      await page.locator("#app-nav [data-app-view='metadata']").click();
+      response = page.waitForResponse((r) => /\/player-[\w-]+\.js$/.test(r.url()));
+    } finally {
+      release();
+    }
+
+    await response;
+    await page.waitForLoadState("networkidle");
+    await expect(page.locator("body")).not.toHaveClass(/is-playing/);
+    await expect(page.locator(".drawer-player")).toHaveCount(0);
+    await expect(page.locator("body")).toHaveAttribute("data-app-view", "metadata");
+  });
+});
 
 test("starts with the graphite visual direction and landing navigation", async ({ page }) => {
   await page.addInitScript(() => {
@@ -1357,8 +1546,6 @@ test("the landing page keeps its type readable on a phone", async ({ page }) => 
     demo: getComputedStyle(document.querySelector(".demo")!).backgroundColor,
   }));
   expect(dark).toEqual({ page: "rgb(9, 11, 13)", demo: "rgb(14, 17, 20)" });
-  // The structure's list is the analyzer's, which comes by itself once the page is idle.
-  await page.locator(".tree").waitFor({ state: "attached" });
   const type = await page.evaluate(() => ({
     title: parseFloat(getComputedStyle(document.querySelector(".hero h1")!).fontSize),
     introduction: parseFloat(getComputedStyle(document.querySelector(".hero .lede")!).fontSize),
@@ -1373,7 +1560,7 @@ test("the landing page keeps its type readable on a phone", async ({ page }) => 
       ),
     ),
     bodyFont: getComputedStyle(document.body).fontFamily,
-    codeFont: getComputedStyle(document.querySelector(".tree")!).fontFamily,
+    codeFont: getComputedStyle(document.documentElement).getPropertyValue("--mono"),
   }));
   expect(type.title).toBeGreaterThanOrEqual(30);
   expect(type.introduction).toBeGreaterThanOrEqual(16);
@@ -1634,6 +1821,117 @@ test("the phone bytes view reserves room for reading the bytes", async ({ page }
   expect(treeHeight).toBeLessThanOrEqual((await page.evaluate(() => innerHeight)) * 0.2);
 });
 
+test("a phone long-press peeks at a byte without pinning a selection", async ({ page }, info) => {
+  test.skip(info.project.name !== "phone", "long-press is a touch interaction");
+  await page.setViewportSize({ width: 320, height: 780 });
+  await page.goto("./?sample=photo.jpg");
+  await expect(page.locator(".verdict-title")).toBeVisible();
+  await openView(page, "bytes");
+  const canvas = page.locator(".hex-canvas");
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("The byte canvas is not visible");
+  const point = { x: box.x + 85, y: box.y + 24 };
+
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x: point.x, y: point.y }],
+  });
+  await page.waitForTimeout(550);
+  await expect(page.locator("#status")).toContainText("0x00000000");
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchEnd",
+    touchPoints: [],
+  });
+
+  await expect(page.getByRole("dialog", { name: "Selected part" })).toHaveCount(0);
+  await expect(page.locator("#status")).toContainText("0x00000000");
+});
+
+test("a phone byte peek cancels after the touch moves", async ({ page }, info) => {
+  test.skip(info.project.name !== "phone", "long-press is a touch interaction");
+  await page.setViewportSize({ width: 320, height: 780 });
+  await page.goto("./?sample=photo.jpg");
+  await expect(page.locator(".verdict-title")).toBeVisible();
+  await openView(page, "bytes");
+  const canvas = page.locator(".hex-canvas");
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("The byte canvas is not visible");
+  const point = { x: box.x + 85, y: box.y + 24 };
+  const before = await page.locator("#status").textContent();
+
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchStart",
+    touchPoints: [{ x: point.x, y: point.y }],
+  });
+  await page.waitForTimeout(50);
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchMove",
+    touchPoints: [{ x: point.x, y: point.y + 20 }],
+  });
+  await cdp.send("Input.dispatchTouchEvent", {
+    type: "touchEnd",
+    touchPoints: [],
+  });
+  await page.waitForTimeout(550);
+
+  await expect(page.locator("#status")).toHaveText(before ?? "");
+  await expect(page.getByRole("dialog", { name: "Selected part" })).toHaveCount(0);
+});
+
+test("a cancelled phone touch cannot select a replacement file later", async ({ page }, info) => {
+  test.skip(info.project.name !== "phone", "the touch replacement race is phone-specific");
+  await page.setViewportSize({ width: 320, height: 780 });
+  await page.goto("./?sample=photo.jpg");
+  await expect(page.locator(".verdict-title")).toBeVisible();
+  await openView(page, "bytes");
+  const canvas = page.locator(".hex-canvas");
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("The byte canvas is not visible");
+  await canvas.evaluate((element, point) => {
+    for (const type of ["pointerdown", "pointercancel"] as const) {
+      element.dispatchEvent(new PointerEvent(type, {
+        bubbles: true,
+        pointerId: 42,
+        pointerType: "touch",
+        isPrimary: true,
+        button: 0,
+        buttons: type === "pointerdown" ? 1 : 0,
+        clientX: point.x,
+        clientY: point.y,
+      }));
+    }
+  }, { x: box.x + 85, y: box.y + 24 });
+
+  await page.locator("#picker").setInputFiles(new URL("../public/samples/sample.png", import.meta.url).pathname);
+  await expect(page.locator(".filename")).toContainText("sample.png");
+  const more = page.locator("#app-nav .app-nav-more > summary");
+  await more.focus();
+  await page.keyboard.press("Enter");
+  const bytes = page.locator("#app-nav [data-app-view='bytes']");
+  await bytes.focus();
+  await page.keyboard.press("Enter");
+  await expect(canvas).toBeVisible();
+  const currentBox = await canvas.boundingBox();
+  if (!currentBox) throw new Error("The replacement byte canvas is not visible");
+  await canvas.evaluate((element, point) => {
+    element.dispatchEvent(new PointerEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 42,
+      pointerType: "touch",
+      isPrimary: true,
+      button: 0,
+      buttons: 0,
+      detail: 1,
+      clientX: point.x,
+      clientY: point.y,
+    }));
+  }, { x: currentBox.x + 85, y: currentBox.y + 24 });
+  await expect(page.getByRole("dialog", { name: "Selected part" })).toHaveCount(0);
+});
+
 test("the phone can inspect a photo in Ukrainian and return to its clean-copy action", async ({ page }, info) => {
   test.skip(info.project.name !== "phone", "the narrow inspection flow is phone-specific");
   await page.setViewportSize({ width: 320, height: 780 });
@@ -1813,6 +2111,29 @@ test("the landing page does not download article copy before a guide opens", asy
   expect((await Promise.all(guideCopyScripts)).filter(Boolean)).toEqual([]);
 });
 
+test("keeps the analyzer unloaded until someone opens a file picker", async ({ page }) => {
+  await home(page);
+  await page.waitForTimeout(4000);
+  expect(await analyzerChunksLoaded(page), "the idle landing should not import the file analyzer").toEqual([]);
+
+  const chooserEvent = page.waitForEvent("filechooser");
+  await page.locator('button[data-opens="picker-empty"]').first().click();
+  const chooser = await chooserEvent;
+  await expect.poll(async () => (await analyzerChunksLoaded(page)).length, { message: "opening the picker should warm the analyzer" }).toBeGreaterThan(0);
+  await chooser.setFiles(sample("photo.jpg"));
+  await expect(page.locator(".verdict-title")).toContainText("photo");
+});
+
+test("keyboard O opens the picker and warms the analyzer", async ({ page }) => {
+  await home(page);
+  const chooserEvent = page.waitForEvent("filechooser");
+  await page.keyboard.press("o");
+  const chooser = await chooserEvent;
+  await expect.poll(async () => (await analyzerChunksLoaded(page)).length, { message: "keyboard O should warm the analyzer" }).toBeGreaterThan(0);
+  await chooser.setFiles(sample("photo.jpg"));
+  await expect(page.locator(".verdict-title")).toContainText("photo");
+});
+
 test("file results show the summary before evidence and available actions", async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem("hexscope.language", "en");
@@ -1868,6 +2189,93 @@ test("file results show the summary before evidence and available actions", asyn
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     }
   }
+});
+
+test("imports PDF redaction code only for PDF files", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("hexscope.tour", "done"));
+  // The service worker intentionally precaches the whole app for offline use;
+  // these are page-initiated module imports, not install-time cache requests.
+  const scripts: string[] = [];
+  page.on("request", (request) => {
+    if (request.resourceType() === "script") scripts.push(request.url());
+  });
+
+  await page.goto("./?sample=photo.jpg");
+  await expect(page.locator(".verdict-title")).toBeVisible();
+  await page.waitForLoadState("networkidle");
+  expect(scripts.some((url) => url.includes("/pdf-redactor-view-"))).toBe(false);
+
+  await page.goto("./?sample=report.pdf");
+  await expect(page.locator(".redactor")).toBeVisible();
+  expect(scripts.some((url) => url.includes("/pdf-redactor-view-"))).toBe(true);
+});
+
+test("does not mount a PDF editor after switching files while its chunk loads", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("hexscope.tour", "done"));
+  let release!: () => void;
+  let requested!: () => void;
+  const delayed = new Promise<void>((resolve) => { release = resolve; });
+  const chunkRequested = new Promise<void>((resolve) => { requested = resolve; });
+  await page.route("**/pdf-redactor-view-*.js", async (route) => {
+    requested();
+    await delayed;
+    await route.continue();
+  });
+
+  await page.goto("./?sample=report.pdf");
+  await expect(page.locator(".verdict-title")).toBeVisible();
+  await expect(page.locator(".redactor[aria-busy=true]")).toBeVisible();
+  await chunkRequested;
+  await page.locator("#picker").setInputFiles(sample("photo.jpg"));
+  await expect(page.locator(".verdict-title")).toContainText("photo");
+
+  const chunkFinished = page.waitForEvent("requestfinished", (request) => request.url().includes("/pdf-redactor-view-"));
+  release();
+  await chunkFinished;
+  await expect(page.locator(".redactor")).toHaveCount(0);
+});
+
+test("lets someone retry if the PDF tools fail to load", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("hexscope.tour", "done"));
+  let attempts = 0;
+  await page.route("**/pdf-redactor-view-*.js", async (route) => {
+    attempts++;
+    if (attempts === 1) await route.abort();
+    else await route.continue();
+  });
+
+  await page.goto("./?sample=report.pdf");
+  await expect(page.getByText("PDF tools could not be loaded. Try again.")).toBeVisible();
+  await page.getByRole("button", { name: "Try again" }).click();
+  await expect(page.locator(".redactor").getByRole("button", { name: "Find", exact: true })).toBeVisible();
+});
+
+test("loads the file report and JSON export modules when requested", async ({ page }, info) => {
+  test.skip(info.project.name !== "computer", "The download assertion uses the desktop browser profile.");
+  await page.addInitScript(() => localStorage.setItem("hexscope.tour", "done"));
+  const scripts: string[] = [];
+  page.on("request", (request) => {
+    if (request.resourceType() === "script") scripts.push(request.url());
+  });
+  page.on("download", (download) => void download.cancel());
+
+  await page.goto("./?sample=photo.jpg");
+  await expect(page.locator(".verdict-title")).toBeVisible();
+  await page.waitForLoadState("networkidle");
+  expect(scripts.some((url) => url.includes("/report-"))).toBe(false);
+  expect(scripts.some((url) => url.includes("/export-"))).toBe(false);
+  await page.locator(".more-details > summary").click();
+
+  await page.getByRole("button", { name: "Report a problem with this file" }).click();
+  const report = page.locator("dialog.report");
+  await expect(report).toBeVisible();
+  expect(scripts.some((url) => url.includes("/report-"))).toBe(true);
+  await report.locator(".report-actions button").last().click();
+
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Save the structure as JSON" }).click();
+  await (await download).cancel();
+  expect(scripts.some((url) => url.includes("/export-"))).toBe(true);
 });
 
 test("a photo: the answer, where it was taken, and an evidence-based clean-copy result", async ({ page }, info) => {
@@ -2255,6 +2663,25 @@ test("a photo copied as a clean picture: pixels only, nothing else", async ({ pa
   expect(chunks.filter((c) => !["IHDR", "IDAT", "IEND", "sRGB", "gAMA", "cHRM", "pHYs", "iCCP"].includes(c))).toEqual([]);
 });
 
+test("a phone clipboard permission failure tells the person how to continue", async ({ page }) => {
+  await home(page);
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { read: () => Promise.reject(new DOMException("permission denied", "NotAllowedError")) },
+    });
+    document.querySelector<HTMLButtonElement>("[data-paste]")!.hidden = false;
+  });
+  await page.locator(".hero-other-ways > summary").click();
+
+  const paste = page.locator("[data-paste]");
+  await expect(paste).toBeVisible();
+  await paste.click();
+  await expect(page.locator("#load-error")).toBeVisible();
+  await expect(page.locator("#load-error")).toContainText("choose the file");
+  await expect(page.locator("body")).toHaveAttribute("data-state", "empty");
+});
+
 test("the keyboard list closes every way people try: ×, Escape, a click outside, ? again", async ({ page }, info) => {
   test.skip(info.project.name !== "computer", "keys are for a computer");
   await home(page);
@@ -2499,7 +2926,13 @@ test("after one visit, it works offline — a document too", async ({ page, cont
       const cache = keys.find((k) => k.startsWith("hexscope-") && k !== "hexscope-shared");
       if (cache) {
         const urls = (await (await caches.open(cache)).keys()).map((r) => r.url);
-        if (urls.filter((u) => u.endsWith(".wasm")).length >= 2 && urls.some((u) => u.endsWith("redacted.pdf"))) return;
+        if (
+          urls.filter((u) => u.endsWith(".wasm")).length >= 2 &&
+          urls.some((u) => u.endsWith("redacted.pdf")) &&
+          urls.some((u) => /pdf-redactor-view-[^/]+\.js$/.test(u)) &&
+          urls.some((u) => /report-[^/]+\.js$/.test(u)) &&
+          urls.some((u) => /export-[^/]+\.js$/.test(u))
+        ) return;
       }
       await new Promise((r) => setTimeout(r, 200));
     }
@@ -2511,6 +2944,20 @@ test("after one visit, it works offline — a document too", async ({ page, cont
   await page.locator('label[for="example-document"]').click();
   await page.locator('#examples [data-example-panel="document"] button[data-sample]').click();
   await expect(page.locator(".verdict-title")).toHaveText(/^This PDF gives away/);
+  await page.locator("#picker").setInputFiles(sample("report.pdf"));
+  await expect(page.locator("#fileinfo .filename")).toHaveText("report.pdf");
+  const redactor = page.locator(".redactor");
+  await redactor.locator('input[type="search"]').fill("Salary");
+  await redactor.getByRole("button", { name: "Find", exact: true }).click();
+  await expect(redactor.locator("mark.redact-hit")).toContainText("Salary");
+  await page.locator(".more-details > summary").click();
+  const report = page.locator("dialog.report");
+  await page.getByRole("button", { name: "Report a problem with this file" }).click();
+  await expect(report).toBeVisible();
+  await report.locator(".report-actions button").last().click();
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Save the structure as JSON" }).click();
+  await (await download).cancel();
   await page.goto("./black-out-a-pdf.html");
   await expect(page).toHaveTitle(/black out a PDF/i);
 });

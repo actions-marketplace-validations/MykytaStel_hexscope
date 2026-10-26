@@ -18,7 +18,7 @@ use hexscope_core::model::{NodeKind, ParseTree, Value};
 use hexscope_core::png::{MAX_PIXEL_BYTES, PngDocument};
 use hexscope_core::verification::VerificationSnapshot;
 use hexscope_core::video::{Gap, parse_video_gapped};
-use hexscope_core::zip::{ExtractError, ZipEntry, extract};
+use hexscope_core::zip::{ExtractError, ZipEntry, extract, extract_compressed};
 use hexscope_core::{Document, Format, parse as parse_any};
 use wasm_bindgen::prelude::*;
 
@@ -134,7 +134,52 @@ use tables::{DocTables, ZipState};
 /// as warning and error nodes, and an unsupported format still gets a tree.
 #[wasm_bindgen]
 pub fn parse(bytes: &[u8]) -> Parsed {
-    parsed(parse_any(bytes), bytes, bytes.len() as u64)
+    parsed(
+        parse_any(bytes),
+        SourceBytes::Borrowed(bytes),
+        bytes.len() as u64,
+        true,
+    )
+}
+
+/// Parses a file while keeping ownership of the input allocation. Formats
+/// that need the original bytes can retain it without making another copy.
+#[wasm_bindgen(js_name = parseOwned)]
+pub fn parse_owned(bytes: Vec<u8>) -> Parsed {
+    let len = bytes.len() as u64;
+    let doc = parse_any(&bytes);
+    parsed(doc, SourceBytes::Owned(bytes), len, true)
+}
+
+/// Parses a file without retaining a second full copy of a ZIP source. The
+/// caller can supply only an entry's compressed range when it is opened or
+/// played; other formats keep any source bytes their parser needs.
+#[wasm_bindgen(js_name = parseOwnedExternal)]
+pub fn parse_owned_external(bytes: Vec<u8>) -> Parsed {
+    let len = bytes.len() as u64;
+    let doc = parse_any(&bytes);
+    parsed(doc, SourceBytes::Owned(bytes), len, false)
+}
+
+enum SourceBytes<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl SourceBytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    fn retain(self) -> Vec<u8> {
+        match self {
+            Self::Borrowed(bytes) => bytes.to_vec(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
 }
 
 /// Whether a file of `len` bytes that starts with `head` is an MP4 or
@@ -167,12 +212,13 @@ pub fn parse_movie(bytes: &[u8], gaps_at: &[f64]) -> Parsed {
         .fold(bytes.len() as u64, |n, g| n.saturating_add(g.len));
     parsed(
         Document::Video(parse_video_gapped(bytes, &gaps)),
-        bytes,
+        SourceBytes::Borrowed(bytes),
         len,
+        true,
     )
 }
 
-fn parsed(doc: Document, bytes: &[u8], len: u64) -> Parsed {
+fn parsed(doc: Document, source: SourceBytes<'_>, len: u64, retain_zip_source: bool) -> Parsed {
     let summary = hexscope_core::summary::summary_of(&doc);
     let metadata_complete = summary.complete;
     let verification = hexscope_core::verification::snapshot(&summary);
@@ -189,11 +235,11 @@ fn parsed(doc: Document, bytes: &[u8], len: u64) -> Parsed {
         })
         .collect();
     let mut parsed = match doc {
-        Document::Png(doc) => with_png(bytes, doc),
+        Document::Png(doc) => with_png(source.as_slice(), doc),
         Document::Jpeg(doc) => {
             let mut parsed = flatten(&doc.tree);
             parsed.format = "jpeg";
-            parsed.source = bytes.to_vec();
+            parsed.source = source.retain();
             parsed.dimensions = doc.width.zip(doc.height).map(|(w, h)| [w as u32, h as u32]);
             add_facts(&mut parsed, &doc.facts);
             parsed
@@ -240,7 +286,7 @@ fn parsed(doc: Document, bytes: &[u8], len: u64) -> Parsed {
                 parsed.facts.push((f.kind, sanitise(&f.text), f.node));
             }
             if !doc.attachments.is_empty() {
-                parsed.pdf_source = bytes.to_vec();
+                parsed.pdf_source = source.retain();
                 parsed.attachment_names =
                     doc.attachments.iter().map(|(n, _)| sanitise(n)).collect();
             }
@@ -269,7 +315,7 @@ fn parsed(doc: Document, bytes: &[u8], len: u64) -> Parsed {
                 parsed.facts.push((f.kind, sanitise(&f.text), f.node));
             }
             parsed.zip = Some(ZipState {
-                source: bytes.to_vec(),
+                source: retain_zip_source.then(|| source.retain()),
                 entries: doc.entries,
             });
             parsed
@@ -281,7 +327,7 @@ fn parsed(doc: Document, bytes: &[u8], len: u64) -> Parsed {
                 parsed.facts.push((f.kind, sanitise(&f.text), f.node));
             }
             if !doc.attachments.is_empty() {
-                parsed.pdf_source = bytes.to_vec();
+                parsed.pdf_source = source.retain();
                 parsed.attachment_names = doc.attachments.iter().map(|n| sanitise(n)).collect();
             }
             parsed
@@ -293,7 +339,7 @@ fn parsed(doc: Document, bytes: &[u8], len: u64) -> Parsed {
                 parsed.facts.push((f.kind, sanitise(&f.text), f.node));
             }
             if !doc.attachments.is_empty() {
-                parsed.pdf_source = bytes.to_vec();
+                parsed.pdf_source = source.retain();
                 parsed.attachment_names = doc.attachments.iter().map(|n| sanitise(n)).collect();
             }
             parsed

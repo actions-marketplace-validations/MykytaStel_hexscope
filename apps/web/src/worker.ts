@@ -4,89 +4,27 @@
 import type { CleanCopy, Parsed } from "./wasm-pdf/hexscope_pdf.js";
 import { type PageArea, type ParsedFile } from "./model";
 import { describe, SEPARATOR } from "./describe";
-import { assemble, LARGE_MOVIE, movieEntropy, readMovie, type Movie } from "./movie";
+import {
+  assemble,
+  LARGE_MOVIE,
+  movieEntropy,
+  readMovie,
+  wholeMovieBytes,
+  type Movie,
+  type MovieReadOptions,
+} from "./movie";
 import { isPdf, paintJpegs } from "./paint";
 import { familyOf, isMedia, type Family } from "./family";
 import { PARSER_BUILDS } from "./parser-builds";
-import { MAX_VERIFY_BYTES, decodeCoreVerification, uncheckedReport, verifyFileOutput, verifyPdfSelections, type VerificationFinding, type VerificationPage, type VerificationReport, type VerificationSelection } from "./verification";
+import { MAX_VERIFY_BYTES, decodeCoreVerification, uncheckedReport, verifyFileOutput, verifyPdfSelections, type VerificationPage, type VerificationReport } from "./verification";
 import { FACT_LABELS } from "./knowledge";
 import { searchable } from "./redactor";
 import { meaning } from "./qr/meaning";
-import type { FilmScanReport } from "./filmscan";
-import type { FilmSettings } from "./film-lab";
-import type { FilmRenderResult } from "./film-render";
-import { LatestFilmQueue } from "./film-queue";
-import { profileFromTree } from "./film-profile";
-
-export type WorkerRequest =
-  | { id: number; type: "parse"; file: File }
-  | { id: number; type: "steps"; from: number; count: number }
-  | { id: number; type: "inflated" }
-  | { id: number; type: "explain"; index: number; knownBlock: number }
-  | { id: number; type: "selectEntry"; index: number }
-  | { id: number; type: "open"; index: number }
-  | { id: number; type: "openBytes"; bytes: Uint8Array }
-  | { id: number; type: "back"; depth: number }
-  | { id: number; type: "clean"; source: Blob; notes?: boolean; verify?: boolean }
-  | {
-      id: number;
-      type: "verifyCopy";
-      copy: Blob;
-      sourceFormat: ParsedFile["format"];
-      sourceFindings: VerificationFinding[];
-      retainedReasons: Record<string, string>;
-      sourceToken?: number;
-      selections?: VerificationSelection[];
-    }
-  | { id: number; type: "repair"; bytes: Uint8Array }
-  | { id: number; type: "filmRoll"; source: Blob; settings: FilmSettings; format: "jpeg" | "tiff16" }
-  | { id: number; type: "filmRender"; source: Blob; dimensions: [number, number]; orientation: number; settings: FilmSettings; purpose: "preview" | "export"; point?: [number, number] }
-  | { id: number; type: "pageTexts"; bytes: Uint8Array }
-  | { id: number; type: "pagePictures"; bytes: Uint8Array; page: number }
-  | { id: number; type: "redact"; bytes: Uint8Array; areas: Float64Array }
-  | { id: number; type: "locate"; by: 0 | 1; pos: number }
-  | { id: number; type: "blocks" }
-  | { id: number; type: "codes"; picture?: Blob; pictureDimensions?: [number, number]; pdf?: Uint8Array; entries?: { index: number; name: string }[]; inspectFilmScan?: boolean };
-
-export type WorkerResponse =
-  | { id: number; type: "parsed"; result: ParsedFile; bytes: Uint8Array }
-  | { id: number; type: "opened"; result: ParsedFile; bytes: Uint8Array }
-  | { id: number; type: "back" }
-  | { id: number; type: "cleaned"; copy: Blob; removed: { what: string; bytes: number }[]; orientation: number; error: string; verification?: string }
-  | { id: number; type: "verification"; report: VerificationReport }
-  | { id: number; type: "filmRollOutput"; result: import("./film-roll-worker").RollOutput }
-  | { id: number; type: "filmRendered"; result: FilmRenderResult }
-  | { id: number; type: "repaired"; bytes: Uint8Array; fixed: string[]; error: string }
-  | { id: number; type: "pageTexts"; pages: PageGlyphs[] }
-  | { id: number; type: "pagePictures"; pictures: PagePicture[] }
-  | { id: number; type: "steps"; steps: Float64Array }
-  | { id: number; type: "located"; step: Float64Array }
-  | { id: number; type: "blocks"; map: Float64Array; note: string }
-  | { id: number; type: "inflated"; bytes: Uint8Array }
-  | { id: number; type: "explain"; parts: Float64Array; tables: Float64Array | null }
-  | { id: number; type: "stream"; playable: boolean; trace: number[] | null; segments: Float64Array; idatBytes: number }
-  | { id: number; type: "codes"; codes: { text: string; where: string; box: [number, number, number, number] }[]; filmScan?: FilmScanReport }
-  | { id: number; type: "error"; message: string };
-
-/** One page's visible glyphs: where each lands, four numbers each, and its text. */
-export interface PageGlyphs {
-  media: PageArea;
-  areas: Float64Array;
-  texts: string[];
-  /** Whether every supported Form XObject on this page was inspected. */
-  complete: boolean;
-  /** The page's own dark boxes and marks, four numbers each. */
-  boxes: Float64Array;
-}
-
-/** A picture a page draws: where its unit square goes, and a JPEG's bytes or its pixels. */
-export interface PagePicture {
-  matrix: number[];
-  jpeg?: Uint8Array;
-  width?: number;
-  height?: number;
-  rgba?: Uint8ClampedArray;
-}
+import { scanCodes } from "./worker-qr-scan";
+import { readEntry, selectEntry } from "./worker-entry-source";
+import { createFilmQueue, handleFilmOperation, type FilmWorkerServices } from "./worker-film";
+import type { OperationRequest, PageGlyphs, PagePicture, WorkerRequest, WorkerResponse } from "./worker-protocol";
+export type { OperationRequest, PageGlyphs, PagePicture, WorkerRequest, WorkerResponse } from "./worker-protocol";
 
 /**
  * The parser's builds, one per family of files: pictures, movies and SVG
@@ -145,6 +83,13 @@ function prefetchDocuments(): void {
 }
 /** The file, then each entry opened inside it; the last one is on screen. */
 let stack: Parsed[] = [];
+/** Source Blobs parallel to `stack`; nested files keep their ZIP bytes in WASM. */
+let stackSources: (Blob | null)[] = [];
+/** Active asynchronous parser and QR operations, cancellable by request ID. */
+const activeOperations = new Map<number, AbortController>();
+/** Parsed files wait here until the page accepts the result and commits it. */
+const pendingParses = new Map<number, Parsed>();
+const pendingSources = new Map<number, Blob | null>();
 /** The open source parse used to compare the actual clean-copy bytes. */
 const verificationSources = new Map<number, Parsed>();
 const verificationTokens = new WeakMap<Parsed, number>();
@@ -170,6 +115,47 @@ function clearParsedStack(): void {
     parsed.free();
   }
   stack = [];
+  stackSources = [];
+}
+
+function discardPendingParse(id: number): void {
+  const parsed = pendingParses.get(id);
+  pendingSources.delete(id);
+  if (!parsed) return;
+  pendingParses.delete(id);
+  releaseParsedSource(parsed);
+  parsed.free();
+}
+
+function commitPendingParse(id: number): void {
+  const parsed = pendingParses.get(id);
+  if (!parsed) return;
+  pendingParses.delete(id);
+  const source = pendingSources.get(id) ?? null;
+  pendingSources.delete(id);
+  clearParsedStack();
+  stack = [parsed];
+  stackSources = [source];
+}
+
+function stageParsed(
+  id: number,
+  parsed: Parsed,
+  result: ParsedFile,
+  bytes: Uint8Array,
+  source: Blob | null,
+): void {
+  rememberParsedSource(parsed, result, id);
+  pendingParses.set(id, parsed);
+  pendingSources.set(id, source);
+  try {
+    post({ id, type: "parsed", result, bytes }, [...transfers(result), bytes.buffer]);
+  } catch (error) {
+    pendingParses.delete(id);
+    pendingSources.delete(id);
+    releaseParsedSource(parsed);
+    throw error;
+  }
 }
 
 const post = (msg: WorkerResponse, transfer: Transferable[] = []) =>
@@ -205,11 +191,78 @@ function addEntropy(result: ParsedFile, bytes: Uint8Array, wasm: Module): void {
   result.entropyWindow = Math.ceil(bytes.length / bins);
 }
 
+function reportParseProgress(id: number): void {
+  post({
+    id,
+    type: "progress",
+    progress: { stage: "parse", loaded: 0, total: 1, cancellable: false },
+  });
+}
+
 /** A movie read in parts, when `file` is one large enough to need it. */
-async function largeMovie(file: Blob): Promise<Movie | null> {
+async function largeMovie(file: Blob, options?: MovieReadOptions): Promise<Movie | null> {
   if (file.size < LARGE_MOVIE) return null;
   const wasm = await loadMedia();
-  return readMovie(file, (head, len) => wasm.isMovie(head, len));
+  return readMovie(file, (head, len) => wasm.isMovie(head, len), LARGE_MOVIE, options);
+}
+
+async function parseFile(req: Extract<OperationRequest, { type: "parse" }>): Promise<void> {
+  const controller = new AbortController();
+  activeOperations.set(req.id, controller);
+  const options: MovieReadOptions = {
+    signal: controller.signal,
+    onProgress: (progress) => post({ id: req.id, type: "progress", progress }),
+  };
+  try {
+    const movie = await largeMovie(req.file, options);
+    controller.signal.throwIfAborted();
+    if (movie) {
+      const wasm = await loadMedia();
+      controller.signal.throwIfAborted();
+      reportParseProgress(req.id);
+      const t0 = performance.now();
+      const parsed = wasm.parseMovie(movie.given, movie.gaps);
+      let retained = false;
+      try {
+        const result = describe(parsed);
+        result.parseMs = performance.now() - t0;
+        const e = await movieEntropy(req.file, movie, ENTROPY_BINS, (b) => wasm.entropy(b, 1)[0], options);
+        result.entropy = e.values;
+        result.entropyWindow = e.window;
+        result.missing = movie.missing;
+        controller.signal.throwIfAborted();
+        stageParsed(req.id, parsed, result, wholeMovieBytes(movie), null);
+        retained = true;
+      } finally {
+        if (!retained) parsed.free();
+      }
+      return;
+    }
+    const bytes = new Uint8Array(await req.file.arrayBuffer());
+    controller.signal.throwIfAborted();
+    const wasm = await moduleFor(bytes);
+    controller.signal.throwIfAborted();
+    // Timed from the call into WASM through reading every array back out, so
+    // the number shown to the user is the whole cost, not the flattering part.
+    const t0 = performance.now();
+    const parsed = wasm.parseOwnedExternal(bytes);
+    let retained = false;
+    try {
+      const result = describe(parsed);
+      result.parseMs = performance.now() - t0;
+      addEntropy(result, bytes, wasm);
+      controller.signal.throwIfAborted();
+      // Source-dependent parsers keep this WASM allocation; the page receives
+      // the JavaScript buffer by transfer, without another page-side copy.
+      stageParsed(req.id, parsed, result, bytes, parsed.format === "zip" ? req.file : null);
+      retained = true;
+      if (isMedia(bytes)) prefetchDocuments();
+    } finally {
+      if (!retained) parsed.free();
+    }
+  } finally {
+    activeOperations.delete(req.id);
+  }
 }
 
 /** Answers with a copy the parser made, as a file made by `wrap`. */
@@ -222,210 +275,50 @@ function postCopy(id: number, c: CleanCopy, wrap: (bytes: Uint8Array) => Blob, v
   c.free();
 }
 
-/** A picture's longer side, at most, when looking for QR codes in it: a code in a large photo is still many pixels a module. */
-const CODE_SCAN = 2400;
-/** Pages of a PDF whose pictures are looked through for codes. */
-const PDF_PAGES = 30;
-
-/** A picture's brightness, one byte a pixel, scaled down if it is large; null when the browser cannot decode it. */
-async function brightness(
-  image: Blob | ImageData,
-  resize: ImageBitmapOptions | undefined,
-  luminance: (rgba: Uint8ClampedArray | Uint8Array, width: number, height: number) => Uint8Array,
-): Promise<{ lum: Uint8Array; width: number; height: number } | null> {
-  let bitmap: ImageBitmap | null = null;
-  if (resize) {
-    try {
-      bitmap = await createImageBitmap(image, resize);
-    } catch {
-      // Older browsers may decode this image but not support resize options.
-    }
+/** Does not touch WASM-backed stream state after the selected file has been freed. */
+function postSelectedStream(id: number, current: Parsed, playable: boolean, isActive: boolean): void {
+  if (!isActive) {
+    const segments = new Float64Array();
+    post({ id, type: "stream", playable: false, trace: null, segments, idatBytes: 0 }, [segments.buffer]);
+    return;
   }
-  bitmap ??= await createImageBitmap(image).catch(() => null);
-  if (!bitmap) return null;
-  try {
-    const scale = Math.min(1, CODE_SCAN / Math.max(bitmap.width, bitmap.height));
-    const width = Math.max(1, Math.round(bitmap.width * scale));
-    const height = Math.max(1, Math.round(bitmap.height * scale));
-    const g = new OffscreenCanvas(width, height).getContext("2d", { willReadFrequently: true });
-    if (!g) return null;
-    g.drawImage(bitmap, 0, 0, width, height);
-    return { lum: luminance(g.getImageData(0, 0, width, height).data, width, height), width, height };
-  } finally {
-    bitmap.close();
-  }
+  const trace = Array.from(current.trace);
+  const segments = current.segments;
+  post({ id, type: "stream", playable, trace: trace.length ? trace : null, segments, idatBytes: current.idatBytes }, [
+    segments.buffer,
+  ]);
 }
 
-/** The QR codes in a picture, a PDF's pictures, or the pictures inside the document on top. */
-async function codes(req: Extract<WorkerRequest, { type: "codes" }>): Promise<Pick<Extract<WorkerResponse, { type: "codes" }>, "codes" | "filmScan">> {
-  const { findCodes, luminance, bitmapResizeOptions } = await import("./qr/index");
-  const current = stack[stack.length - 1];
-  const found: Extract<WorkerResponse, { type: "codes" }>["codes"] = [];
-  let filmScan: FilmScanReport | undefined;
-  const look = async (image: Blob | ImageData, where: string, dimensions?: readonly [number, number]) => {
-    const p = await brightness(image, bitmapResizeOptions(dimensions, CODE_SCAN), luminance);
-    if (req.inspectFilmScan) {
-      try {
-        const { inspectFilmScan } = await import("./filmscan");
-        filmScan = p
-          ? inspectFilmScan(p.lum, p.width, p.height)
-          : inspectFilmScan(new Uint8Array(0), 0, 0);
-      } catch {
-        filmScan = {
-          availability: "unavailable",
-          perforationEdges: [],
-          perforationRepeats: 0,
-          frameEdges: [],
-          evidenceStrength: "none",
-        };
-      }
-    }
-    if (!p) return;
-    for (const c of findCodes(p.lum, p.width, p.height)) {
-      if (found.some((f) => f.text === c.text)) continue;
-      const xs = c.corners.map((q) => q.x / p.width);
-      const ys = c.corners.map((q) => q.y / p.height);
-      found.push({ text: c.text, where, box: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)] });
-    }
-  };
-  if (req.picture) await look(req.picture, "", req.pictureDimensions);
-  if (req.pdf) {
-    const t = (await loadPdf()).pdfPictures(req.pdf, PDF_PAGES);
-    for (let i = 0; i < t.count; i++) {
-      const where = `the picture on page ${t.page(i)}`;
-      const [width, height] = t.size(i);
-      const at = t.jpeg(i);
-      if (at.length === 2) {
-        await look(new Blob([req.pdf.subarray(at[0], at[0] + at[1]) as BlobPart], { type: "image/jpeg" }), where, [width, height]);
-      } else {
-        if (width >= 21 && height >= 21) await look(new ImageData(new Uint8ClampedArray(t.rgba(i).buffer as ArrayBuffer), width, height), where, [width, height]);
-      }
-    }
-    t.free();
-    // A code a page draws in boxes, as label and invoice makers do: the boxes painted, then read.
-    const shapes = (await loadPdf()).pdfShapes(req.pdf, PDF_PAGES);
-    for (let i = 0; i < shapes.count; i++) {
-      const [left, bottom, right, top] = shapes.media(i);
-      const scale = Math.min(4, CODE_SCAN / Math.max(right - left, top - bottom));
-      const width = Math.ceil((right - left) * scale);
-      const height = Math.ceil((top - bottom) * scale);
-      const g = new OffscreenCanvas(width, height).getContext("2d", { willReadFrequently: true });
-      if (!g) continue;
-      g.fillStyle = "#fff";
-      g.fillRect(0, 0, width, height);
-      g.fillStyle = "#000";
-      const boxes = shapes.boxes(i);
-      for (let k = 0; k + 3 < boxes.length; k += 4) {
-        const x = (boxes[k] - left) * scale;
-        const y = (top - boxes[k + 3]) * scale;
-        g.fillRect(x, y, (boxes[k + 2] - boxes[k]) * scale, (boxes[k + 3] - boxes[k + 1]) * scale);
-      }
-      const image = g.getImageData(0, 0, width, height);
-      await look(image, `a code drawn on page ${shapes.page(i)}`);
-    }
-    shapes.free();
-  }
-  for (const e of req.entries ?? []) {
-    const bytes = current?.extractEntry(e.index);
-    if (bytes && bytes.length > 0) await look(new Blob([bytes as BlobPart]), e.name);
-  }
-  return { codes: found, ...(filmScan ? { filmScan } : {}) };
+/** Keeps QR and embedded-image scanning outside the parser's central request router. */
+function codes(req: Extract<OperationRequest, { type: "codes" }>, signal?: AbortSignal): ReturnType<typeof scanCodes> {
+  const current = stack[stack.length - 1] ?? null;
+  return scanCodes(
+    req,
+    signal ?? new AbortController().signal,
+    current,
+    loadPdf,
+    stackSources[stackSources.length - 1] ?? null,
+    () => current === null || stack[stack.length - 1] === current,
+  );
 }
+
+const filmServices: FilmWorkerServices = { moduleFor, loadMedia, describe, codes, post };
 
 /** Nested documents opened from archives are kept for the way back. */
 const MAX_DEPTH = 4;
 
-async function handle(req: WorkerRequest): Promise<void> {
-  if (req.type === "filmRoll") {
-    if (req.source.size > 50 * 1024 * 1024) throw new Error("This scan exceeds the 50 MiB file limit.");
-    const head = new Uint8Array(await req.source.slice(0, 12).arrayBuffer());
-    let dimensions: [number, number] | undefined;
-    let orientation = 1;
-    let profilePresent: boolean | null = null;
-    if (isMedia(head)) {
-      const wasm = await moduleFor(head);
-      const parsed = wasm.parse(new Uint8Array(await req.source.arrayBuffer()));
-      try {
-        if (parsed.dimensions.length === 2) dimensions = [parsed.dimensions[0], parsed.dimensions[1]];
-        orientation = parsed.orientation;
-        profilePresent = profileFromTree({ format: parsed.format as ParsedFile["format"], labels: parsed.labels.split(SEPARATOR), kinds: parsed.kinds });
-      } finally { parsed.free(); }
-    }
-    const { renderRoll } = await import("./film-roll-worker");
-    post({ id: req.id, type: "filmRollOutput", result: await renderRoll(req.source, req.settings, req.format, dimensions, orientation, profilePresent) });
-    return;
-  }
-  if (req.type === "filmRender") {
-    const { renderFilm } = await import("./film-render");
-    const result = await renderFilm(req.source, req.dimensions, req.orientation, req.settings, req.purpose, req.point);
-    if (req.purpose === "export") {
-      result.check = { status: "unavailable", metadata: [], qrCount: null };
-      try {
-        if (result.copy.size > MAX_VERIFY_BYTES) throw new Error("copy exceeds readback limit");
-        const wasm = await loadMedia();
-        // Canvas encodes fresh pixels, without copying source metadata segments.
-        // Read the actual result; the cleaner correctly refuses an already-clean file.
-        const bytes = new Uint8Array(await result.copy.arrayBuffer());
-        const parsed = wasm.parse(bytes);
-        try {
-          const f = describe(parsed);
-          if (f.format !== "jpeg" || f.kinds.includes(3) || f.dimensions?.[0] !== result.dimensions[0] || f.dimensions?.[1] !== result.dimensions[1]) throw new Error("copy cannot be completely read");
-          result.check = {
-            status: "checked",
-            metadata: [...f.facts.map((fact) => FACT_LABELS[fact.kind] ?? fact.kind), ...(f.location ? ["Location"] : [])],
-            qrCount: null,
-          };
-        } finally { parsed.free(); }
-        const inspected = await codes({ id: req.id, type: "codes", picture: result.copy, pictureDimensions: result.dimensions, inspectFilmScan: true });
-        result.check.scan = inspected.filmScan;
-        result.check.qrCount = inspected.codes.length > 0 || inspected.filmScan?.availability === "inspected" ? inspected.codes.length : null;
-        result.check.sha256 = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))).map((v) => v.toString(16).padStart(2, "0")).join("");
-      } catch {
-        // Preserve the produced copy; a failed readback never becomes a clean claim.
-      }
-    }
-    post({ id: req.id, type: "filmRendered", result });
+async function handle(req: OperationRequest): Promise<void> {
+  if (req.type === "filmRoll" || req.type === "filmRender") {
+    await handleFilmOperation(req, filmServices);
     return;
   }
   if (req.type === "parse") {
-    const movie = await largeMovie(req.file);
-    if (movie) {
-      const wasm = await loadMedia();
-      const t0 = performance.now();
-      const parsed = wasm.parseMovie(movie.given, movie.gaps);
-      const result = describe(parsed);
-      result.parseMs = performance.now() - t0;
-      const e = await movieEntropy(req.file, movie, ENTROPY_BINS, (b) => wasm.entropy(b, 1)[0]);
-      result.entropy = e.values;
-      result.entropyWindow = e.window;
-      result.missing = movie.missing;
-      clearParsedStack();
-      rememberParsedSource(parsed, result, req.id);
-      stack = [parsed];
-      post({ id: req.id, type: "parsed", result, bytes: movie.whole }, [...transfers(result), movie.whole.buffer]);
-      return;
-    }
-    const bytes = new Uint8Array(await req.file.arrayBuffer());
-    const wasm = await moduleFor(bytes);
-    // Timed from the call into WASM through reading every array back out, so
-    // the number shown to the user is the whole cost, not the flattering part.
-    const t0 = performance.now();
-    const parsed = wasm.parse(bytes);
-    const result = describe(parsed);
-    result.parseMs = performance.now() - t0;
-    addEntropy(result, bytes, wasm);
-    clearParsedStack();
-    rememberParsedSource(parsed, result, req.id);
-    stack = [parsed];
-    if (isMedia(bytes)) prefetchDocuments();
-    // The parser keeps its own copy: these bytes go to the page, moved, not
-    // copied, so a large file is held twice at most rather than three times.
-    post({ id: req.id, type: "parsed", result, bytes }, [...transfers(result), bytes.buffer]);
+    await parseFile(req);
     return;
   }
 
   if (req.type === "clean") {
-    const movie = await largeMovie(req.source);
+    const movie = await largeMovie(req.source, { includeWhole: false });
     if (movie) {
       const source = req.source;
       postCopy(req.id, (await loadMedia()).cleanMovie(movie.given, movie.gaps), (b) => assemble(b, movie, source));
@@ -447,7 +340,7 @@ async function handle(req: WorkerRequest): Promise<void> {
     c ??= wasm.cleanCopy(bytes, req.notes ?? false);
     let verification: string | undefined;
     if (req.verify && !c.error && bytes.length <= MAX_VERIFY_BYTES && c.bytes.length <= MAX_VERIFY_BYTES) {
-      const parsed = wasm.parse(bytes);
+      const parsed = wasm.parseOwned(bytes);
       try { verification = parsed.verifyCopy(c.bytes); } finally { parsed.free(); }
     }
     postCopy(req.id, c, (b) => new Blob([b as BlobPart]), verification);
@@ -620,7 +513,15 @@ async function handle(req: WorkerRequest): Promise<void> {
   }
 
   if (req.type === "codes") {
-    post({ id: req.id, type: "codes", ...(await codes(req)) });
+    const controller = new AbortController();
+    activeOperations.set(req.id, controller);
+    try {
+      const result = await codes(req, controller.signal);
+      controller.signal.throwIfAborted();
+      post({ id: req.id, type: "codes", ...result });
+    } finally {
+      activeOperations.delete(req.id);
+    }
     return;
   }
 
@@ -629,17 +530,31 @@ async function handle(req: WorkerRequest): Promise<void> {
   if (req.type === "open" || req.type === "openBytes") {
     if (stack.length > MAX_DEPTH) throw new Error(`files nest at most ${MAX_DEPTH} deep here`);
     // An archive's entry, or a file found inside the bytes.
-    const bytes = req.type === "open" ? current.extractEntry(req.index) : req.bytes;
+    const bytes = req.type === "open"
+      ? await readEntry(
+        current,
+        stackSources[stackSources.length - 1] ?? null,
+        req.index,
+        () => stack[stack.length - 1] === current,
+      )
+      : req.bytes;
+    if (req.type === "open" && stack[stack.length - 1] !== current) {
+      throw new Error("the file changed while its archive entry was being read");
+    }
     if (bytes.length === 0) throw new Error(`This entry cannot be opened: ${current.extractError}.`);
     // Its own build: a ZIP behind a photo needs the one that reads archives.
     const wasm = await moduleFor(bytes);
+    if (req.type === "open" && stack[stack.length - 1] !== current) {
+      throw new Error("the file changed while its archive entry was being read");
+    }
     const t0 = performance.now();
-    const parsed = wasm.parse(bytes);
+    const parsed = wasm.parseOwned(bytes);
     const result = describe(parsed);
     result.parseMs = performance.now() - t0;
     addEntropy(result, bytes, wasm);
     rememberParsedSource(parsed, result, req.id);
     stack.push(parsed);
+    stackSources.push(null);
     post({ id: req.id, type: "opened", result, bytes }, [...transfers(result), bytes.buffer]);
     return;
   }
@@ -649,6 +564,7 @@ async function handle(req: WorkerRequest): Promise<void> {
       const parsed = stack.pop()!;
       releaseParsedSource(parsed);
       parsed.free();
+      stackSources.pop();
     }
     post({ id: req.id, type: "back" });
     return;
@@ -663,12 +579,13 @@ async function handle(req: WorkerRequest): Promise<void> {
     const steps = current.steps(req.from, req.count);
     post({ id: req.id, type: "steps", steps }, [steps.buffer]);
   } else if (req.type === "selectEntry") {
-    const playable = current.selectEntry(req.index);
-    const trace = Array.from(current.trace);
-    const segments = current.segments;
-    post({ id: req.id, type: "stream", playable, trace: trace.length ? trace : null, segments, idatBytes: current.idatBytes }, [
-      segments.buffer,
-    ]);
+    const playable = await selectEntry(
+      current,
+      stackSources[stackSources.length - 1] ?? null,
+      req.index,
+      () => stack[stack.length - 1] === current,
+    );
+    postSelectedStream(req.id, current, playable, stack[stack.length - 1] === current);
   } else if (req.type === "explain") {
     const parts = current.explain(req.index);
     // Tables change once per block: send them only when the page's are stale.
@@ -680,7 +597,7 @@ async function handle(req: WorkerRequest): Promise<void> {
   }
 }
 
-function answer(req: WorkerRequest): Promise<void> {
+function answer(req: OperationRequest): Promise<void> {
   return handle(req).catch((err: unknown) => {
     // Out of memory, the WebAssembly stops for good: start the next file
     // on a fresh one, and say what happened in words.
@@ -688,7 +605,13 @@ function answer(req: WorkerRequest): Promise<void> {
     const crashed = err instanceof WebAssembly.RuntimeError || /memory|allocation|array buffer/i.test(text);
     if (crashed) {
       for (const family of Object.keys(loaded) as Family[]) delete loaded[family];
+      for (const controller of activeOperations.values()) controller.abort();
+      activeOperations.clear();
+      pendingParses.clear();
+      pendingSources.clear();
+      verificationSources.clear();
       stack = [];
+      stackSources = [];
     }
     post({
       id: req.id,
@@ -697,10 +620,19 @@ function answer(req: WorkerRequest): Promise<void> {
     });
   });
 }
-const filmQueue = new LatestFilmQueue<Extract<WorkerRequest, { type: "filmRender" | "filmRoll" }>>(answer, (req) => {
+const filmQueue = createFilmQueue((req) => answer(req), (req) => {
   post({ id: req.id, type: "error", message: "A newer film lab request replaced this preview." });
 });
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
+  if (event.data.type === "cancel") {
+    activeOperations.get(event.data.target)?.abort();
+    discardPendingParse(event.data.target);
+    return;
+  }
+  if (event.data.type === "commitParse") {
+    commitPendingParse(event.data.target);
+    return;
+  }
   if (event.data.type === "filmRender" || event.data.type === "filmRoll") filmQueue.push(event.data);
   else void answer(event.data);
 };

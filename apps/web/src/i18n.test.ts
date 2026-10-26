@@ -22,6 +22,18 @@ describe("the interface language", () => {
     expect(translateText("A JPEG picture", "uk")).toBe("Зображення JPEG");
   });
 
+  it("translates large-video read progress and cancellation", () => {
+    expect(translateText("Reading video structure: 48%", "uk")).toBe("Читаємо структуру відео: 48%");
+    expect(translateText("Reading video metadata: 100%", "uk")).toBe("Читаємо метадані відео: 100%");
+    expect(translateText("Reading video byte map: 16%", "uk")).toBe("Читаємо карту байтів відео: 16%");
+    expect(translateText("Parsing video metadata…", "uk")).toBe("Розбираємо метадані відео…");
+    expect(translateText("Video read progress", "uk")).toBe("Прогрес читання відео");
+    expect(translateText("This movie has too many top-level boxes to inspect safely.", "uk")).toBe(
+      "У відео забагато блоків верхнього рівня для безпечного читання.",
+    );
+    expect(translateText("Reading was cancelled.", "uk")).toBe("Читання скасовано.");
+  });
+
   it("explains when ZIP contents disagree with the recorded size", () => {
     expect(
       translateText("the extracted size does not match what the archive records", "uk"),
@@ -230,11 +242,25 @@ describe("the interface language", () => {
     expect(translateText("Could not save verification receipt", "uk")).toBe("Не вдалося зберегти квитанцію перевірки");
   });
 
+  it("translates the lazy PDF tool loading and retry states", () => {
+    expect(translateText("Loading PDF tools…", "uk")).toBe("Завантажуємо інструменти PDF…");
+    expect(translateText("PDF tools could not be loaded. Try again.", "uk")).toBe("Не вдалося завантажити інструменти PDF. Спробуйте ще раз.");
+  });
+
+  it("translates the lazy compression player retry state", () => {
+    expect(translateText("Compression player could not be loaded. Try again.", "uk")).toBe(
+      "Не вдалося завантажити плеєр стиснення. Спробуйте ще раз.",
+    );
+  });
+
   it("explains the opt-in batch fingerprint behavior", () => {
     expect(translateText("Include stable SHA-256 copy fingerprints in ZIP receipt (up to 10 MiB per copy)", "uk")).toContain("SHA-256");
     expect(translateText("Direct phone sharing sends copies only; Save as a ZIP includes the receipt and fingerprints.", "uk")).toBe(
       "Пряме поширення з телефона надсилає лише копії; у ZIP будуть квитанція та відбитки.",
     );
+    expect(translateText("Pause reading", "uk")).toBe("Призупинити читання");
+    expect(translateText("Resume reading", "uk")).toBe("Продовжити читання");
+    expect(translateText("Reading paused", "uk")).toBe("Читання призупинено");
   });
 
   it("translates the byte inspector, touch guidance, and copy feedback", () => {

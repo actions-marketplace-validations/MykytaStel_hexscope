@@ -46,10 +46,10 @@ encrypted entries are marked but not read. Multi-disk archives are named and
 read no further.
 
 **Compressed and unusual SVG.** A drawing saved as `.svgz` is gzip: it is
-named as a gzip archive, not read. In a drawing, photos embedded as JPEG or
-PNG are read — up to 16 of them, of up to 32 MiB — and other embedded
-pictures are not. A drawing whose root element carries a namespace prefix
-(`<svg:svg>`) is not recognised as one.
+named as a gzip archive, not read. Base64-embedded JPEG, PNG, WebP, TIFF,
+HEIF and AVIF photos are read and cleaned — up to 16 of them, of up to
+32 MiB each; other embedded picture formats are not. A root element may
+carry a namespace prefix, such as `<svg:svg>`.
 
 ## Limits by design
 
@@ -104,11 +104,12 @@ entries get no field-level nodes, only their entry, data and central record:
 every field of every entry would be millions of nodes, which a browser tab
 cannot hold comfortably. Opened files nest at most four deep.
 
-**Touch is second to pointing.** Below 900 px a file opens on its summary —
-the verdict, what it reveals, the clean copy — and *Bytes* shows the tree
-and the bytes, 8 to a row, the text shrinking to fit. Tapping a pixel works
-as hovering does; elsewhere, hovering over a byte to see what it is has no
-touch equivalent yet beyond tapping to select it.
+**Touch uses gestures in place of pointing.** Below 900 px a file opens on
+its summary — the verdict, what it reveals, the clean copy — and *Bytes*
+shows the tree and the bytes, 8 to a row, the text shrinking to fit. Tapping
+a pixel shows the same details as hovering; holding a byte briefly reveals
+its details without selecting it, and moving the finger cancels the peek.
+A short tap still selects the byte.
 
 **What a PDF page hides is found glyph by glyph, within limits.** A page is
 walked in paint order, including nested Form XObjects, each glyph placed

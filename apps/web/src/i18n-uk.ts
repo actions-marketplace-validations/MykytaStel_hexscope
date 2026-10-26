@@ -549,6 +549,9 @@ const UK: Record<string, string> = {
   "Save it": "Зберегти",
   // Several files at once.
   "Nothing leaves this tab.": "Ніщо не залишає цієї вкладки.",
+  "Pause reading": "Призупинити читання",
+  "Resume reading": "Продовжити читання",
+  "Reading paused": "Читання призупинено",
   "No personal metadata found by the available checks. Visible content has not been cleared.": "Доступні перевірки не знайшли особистих метаданих. Видимий вміст не очищено.",
   "No personal metadata found by the available checks.": "Доступні перевірки не знайшли особистих метаданих.",
   "Make clean copies": "Зробити чисті копії",
@@ -617,6 +620,9 @@ const UK: Record<string, string> = {
   "Could not open these shared files. Share them again from the app that has them.": "Не вдалося відкрити ці спільні файли. Надішліть їх ще раз із програми, де вони зберігаються.",
   "No copy was made": "Копію не створено",
   "Some PDF page or form content could not be fully checked. Search may miss text.": "Не весь вміст сторінок або форм у PDF вдалося перевірити. Пошук може пропустити текст.",
+  "Loading PDF tools…": "Завантажуємо інструменти PDF…",
+  "PDF tools could not be loaded. Try again.": "Не вдалося завантажити інструменти PDF. Спробуйте ще раз.",
+  "Compression player could not be loaded. Try again.": "Не вдалося завантажити плеєр стиснення. Спробуйте ще раз.",
   "PDF not fully checked": "PDF перевірено не повністю",
   "Some PDF page or form content may be missing.": "У PDF може бракувати частини вмісту сторінки або форми.",
   "no copy was made because PDF checks are incomplete": "Копію не створено: перевірку PDF не завершено",
@@ -1301,8 +1307,19 @@ function translateText(value: string, locale: Locale): string {
     return `${mine} ${translateRevealList(match[2])}. Перевірено в браузері за допомогою hexscope, нічого не завантажувалося: ${match[3]}`;
   }
   // Opening, the views' captions and the sentence under "What it's made of".
+  if (value === "Parsing video metadata…") return "Розбираємо метадані відео…";
+  if (value === "Video read progress") return "Прогрес читання відео";
+  if (value === "This movie has too many top-level boxes to inspect safely.") {
+    return "У відео забагато блоків верхнього рівня для безпечного читання.";
+  }
   match = /^Parsing (.+)…$/.exec(value);
   if (match) return `Читаємо ${match[1]}…`;
+  match = /^Reading video (structure|metadata|byte map): (\d+)%$/.exec(value);
+  if (match) {
+    const phase = { structure: "структуру", metadata: "метадані", "byte map": "карту байтів" }[match[1]];
+    return `Читаємо ${phase} відео: ${match[2]}%`;
+  }
+  if (value === "Reading was cancelled.") return "Читання скасовано.";
   match = /^(.+?) · (\d+(?:\.\d+)?) (B|KB|MB|GB)$/.exec(value);
   if (match) return `${translateText(match[1], locale)} · ${size(match[2], match[3])}`;
   match = /^Of its (\d+(?:\.\d+)?) (B|KB|MB|GB), (.+?)( — a second, small copy of the picture among it)?\.$/.exec(value);

@@ -54,7 +54,7 @@ group("a movie read in parts", () => {
   it("gives the answer the whole movie gives, without reading its media", async () => {
     const { bytes } = longVideo(4 << 20);
     const mediaStart = 36;
-    const file = guarded(bytes, mediaStart + 64 * 1024, bytes.length - 1389);
+    const file = guarded(bytes, mediaStart, bytes.length - 1389);
     const movie = await readMovie(file, isMovie, 0);
     expect(movie).not.toBeNull();
     expect(movie!.given.length).toBeLessThan(2000);
@@ -67,6 +67,128 @@ group("a movie read in parts", () => {
     expect(Array.from(parts.starts)).toEqual(Array.from(whole.starts));
     expect(Array.from(parts.lens)).toEqual(Array.from(whole.lens));
     expect(parts.location).toEqual(whole.location);
+  });
+
+  it("keeps the compact parser bytes and sparse full-file view in one allocation", async () => {
+    const { file, bytes } = longVideo(2 << 20);
+    const movie = await readMovie(file, isMovie, 0);
+    expect(movie).not.toBeNull();
+
+    const sparseBytes = movie!.restoreWhole();
+    expect(sparseBytes).not.toBeNull();
+    expect(movie!.given.buffer === sparseBytes!.buffer).toBe(true);
+    const sparse = bytes.slice();
+    sparse.fill(0, 36, bytes.length - 1389);
+    expect(Buffer.compare(sparseBytes!, sparse)).toBe(0);
+  });
+
+  it("restores multiple media gaps without reading any of their bodies", async () => {
+    const box = (type: string, body: Uint8Array) => {
+      const bytes = new Uint8Array(8 + body.length);
+      new DataView(bytes.buffer).setUint32(0, bytes.length);
+      bytes.set(new TextEncoder().encode(type), 4);
+      bytes.set(body, 8);
+      return bytes;
+    };
+    const parts = [
+      box("ftyp", new Uint8Array(4)),
+      box("mdat", new Uint8Array(1 << 20).fill(0x51)),
+      box("free", new Uint8Array([1, 2, 3, 4])),
+      box("mdat", new Uint8Array(1 << 20).fill(0x72)),
+      box("free", new Uint8Array([5, 6, 7])),
+    ];
+    const bytes = new Uint8Array(parts.reduce((size, part) => size + part.length, 0));
+    let offset = 0;
+    for (const part of parts) {
+      bytes.set(part, offset);
+      offset += part.length;
+    }
+    const ranges: [number, number][] = [];
+    offset = parts[0].length;
+    ranges.push([offset + 8, offset + parts[1].length]);
+    offset += parts[1].length + parts[2].length;
+    ranges.push([offset + 8, offset + parts[3].length]);
+    const blob = new Blob([bytes as BlobPart]);
+    const nativeSlice = blob.slice.bind(blob);
+    const file = Object.assign(blob, {
+      slice(start = 0, end = blob.size) {
+        if (ranges.some(([from, to]) => start < to && end > from)) {
+          throw new Error("read media body");
+        }
+        return nativeSlice(start, end);
+      },
+    });
+
+    const movie = await readMovie(file, () => true, 0);
+    expect(movie).not.toBeNull();
+    expect(movie!.joins.length).toBe(2);
+    const sparseBytes = movie!.restoreWhole();
+    expect(sparseBytes).not.toBeNull();
+    const sparse = bytes.slice();
+    for (const [from, to] of ranges) sparse.fill(0, from, to);
+    expect(Buffer.compare(sparseBytes!, sparse)).toBe(0);
+    expect(movie!.given.buffer === sparseBytes!.buffer).toBe(true);
+  });
+
+  it("reads only compact bytes when a movie is being cleaned", async () => {
+    const { file, bytes } = longVideo(2 << 20);
+    const movie = await readMovie(file, isMovie, 0, { includeWhole: false });
+    expect(movie).not.toBeNull();
+    expect(movie!.restoreWhole() === null).toBe(true);
+
+    const parts = describe(parseMovie(movie!.given, movie!.gaps));
+    const whole = describe(parse(bytes));
+    expect(parts.labels).toEqual(whole.labels);
+    expect(parts.values).toEqual(whole.values);
+    expect(Array.from(parts.starts)).toEqual(Array.from(whole.starts));
+
+    const c = cleanMovie(movie!.given, movie!.gaps);
+    const copy = new Uint8Array(await assemble(c.bytes, movie!, file).arrayBuffer());
+    expect(Buffer.compare(copy, cleanCopy(bytes, false).bytes)).toBe(0);
+  });
+
+  it("does not read body bytes when a QuickTime movie starts with mdat", async () => {
+    const bytes = new Uint8Array(8 + (2 << 20));
+    new DataView(bytes.buffer).setUint32(0, bytes.length);
+    bytes.set([0x6d, 0x64, 0x61, 0x74], 4);
+    const file = guarded(bytes, 8, bytes.length);
+
+    const movie = await readMovie(file, () => true, 0);
+
+    expect(movie).not.toBeNull();
+    expect(movie!.missing).toEqual(Float64Array.from([8, bytes.length - 8]));
+  });
+
+  it("stops safely when the top-level box limit hides the media box", async () => {
+    const free = new Uint8Array(8);
+    new DataView(free.buffer).setUint32(0, free.length);
+    free.set([0x66, 0x72, 0x65, 0x65], 4);
+    const mdatAt = free.length;
+    const mdat = new Uint8Array(8 + (1 << 20));
+    new DataView(mdat.buffer).setUint32(0, mdat.length);
+    mdat.set([0x6d, 0x64, 0x61, 0x74], 4);
+    const blob = new Blob([free, mdat]);
+    const nativeSlice = blob.slice.bind(blob);
+    let readMediaBody = false;
+    const file = Object.assign(blob, {
+      slice(start = 0, end = blob.size) {
+        if (start < mdatAt + mdat.length && end > mdatAt + 8) readMediaBody = true;
+        return nativeSlice(start, end);
+      },
+    });
+
+    await expect(readMovie(file, () => true, 0, { maxTopLevelBoxes: 1 })).rejects.toThrow(
+      "too many top-level boxes",
+    );
+    expect(readMediaBody).toBe(false);
+  });
+
+  it("does not call a complete file a truncated box list", async () => {
+    const box = new Uint8Array(8);
+    new DataView(box.buffer).setUint32(0, box.length);
+    box.set([0x66, 0x72, 0x65, 0x65], 4);
+
+    await expect(readMovie(new Blob([box]), () => true, 0, { maxTopLevelBoxes: 1 })).resolves.toBeNull();
   });
 
   it("makes the clean copy the whole movie makes", async () => {
@@ -96,7 +218,7 @@ group("a movie read in parts", () => {
       given: bytes.slice(),
       gaps: new Float64Array(0),
       joins: [],
-      whole: bytes.slice(),
+      restoreWhole: () => bytes.slice(),
       missing: Float64Array.from([384, 256]),
     };
     const result = await movieEntropy(new Blob([bytes as BlobPart]), movie, 1, (sample) => sample[0]);
@@ -112,13 +234,156 @@ group("a movie read in parts", () => {
       given: bytes.slice(),
       gaps: new Float64Array(0),
       joins: [],
-      whole: bytes.slice(),
+      restoreWhole: () => bytes.slice(),
       missing: Float64Array.from([384, 256]),
     };
 
     const result = await movieEntropy(new Blob([bytes as BlobPart]), movie, 4, (sample) => sample[0]);
 
     expect(result.values).toEqual(Float32Array.from([1, 9, 9, 7]));
+  });
+
+  it("reads large non-media ranges in bounded chunks and reports progress", async () => {
+    const ftyp = new Uint8Array(12);
+    new DataView(ftyp.buffer).setUint32(0, ftyp.length);
+    ftyp.set([0x66, 0x74, 0x79, 0x70], 4);
+    const free = new Uint8Array(8 + (2 << 20));
+    new DataView(free.buffer).setUint32(0, free.length);
+    free.set([0x66, 0x72, 0x65, 0x65], 4);
+    const mdatAt = ftyp.length + free.length;
+    const mdat = new Uint8Array(8 + (2 << 20));
+    new DataView(mdat.buffer).setUint32(0, mdat.length);
+    mdat.set([0x6d, 0x64, 0x61, 0x74], 4);
+    const blob = new Blob([ftyp, free, mdat]);
+    const nativeSlice = blob.slice.bind(blob);
+    let largestRead = 0;
+    const file = Object.assign(blob, {
+      slice(start = 0, end = blob.size) {
+        largestRead = Math.max(largestRead, end - start);
+        if (start < mdatAt + 8 && end > mdatAt + 8) throw new Error("read media body");
+        return nativeSlice(start, end);
+      },
+    });
+    const progress: { stage: string; loaded: number; total: number }[] = [];
+
+    const movie = await readMovie(file, () => true, 0, { onProgress: (value: (typeof progress)[number]) => progress.push(value) });
+
+    expect(movie).not.toBeNull();
+    expect(largestRead).toBeLessThanOrEqual(1024 * 1024);
+    expect(progress.some((value) => value.stage === "ranges" && value.loaded > 0)).toBe(true);
+    expect(progress.at(-1)).toMatchObject({ stage: "ranges", loaded: progress.at(-1)?.total });
+  });
+
+  it("stops reading a large movie when its signal is aborted", async () => {
+    const ftyp = new Uint8Array(12);
+    new DataView(ftyp.buffer).setUint32(0, ftyp.length);
+    ftyp.set([0x66, 0x74, 0x79, 0x70], 4);
+    const free = new Uint8Array(8 + (3 << 20));
+    new DataView(free.buffer).setUint32(0, free.length);
+    free.set([0x66, 0x72, 0x65, 0x65], 4);
+    const mdat = new Uint8Array(8 + (2 << 20));
+    new DataView(mdat.buffer).setUint32(0, mdat.length);
+    mdat.set([0x6d, 0x64, 0x61, 0x74], 4);
+    const file = new Blob([ftyp, free, mdat]);
+    const controller = new AbortController();
+    const progress: string[] = [];
+
+    const reading = readMovie(file, () => true, 0, {
+      signal: controller.signal,
+      onProgress: (value: { stage: string }) => {
+        progress.push(value.stage);
+        if (value.stage === "ranges") controller.abort();
+      },
+    });
+
+    await expect(reading).rejects.toThrow(/cancel/i);
+    expect(progress).toContain("ranges");
+  });
+
+  it("bounds concurrent media samples and reports entropy progress", async () => {
+    const bytes = new Uint8Array(4 << 20).fill(7);
+    const blob = new Blob([bytes as BlobPart]);
+    const nativeSlice = blob.slice.bind(blob);
+    let active = 0;
+    let maximum = 0;
+    const file = Object.assign(blob, {
+      slice(start = 0, end = blob.size, contentType?: string) {
+        const part = nativeSlice(start, end, contentType);
+        const nativeRead = part.arrayBuffer.bind(part);
+        Object.defineProperty(part, "arrayBuffer", {
+          value: async () => {
+            active++;
+            maximum = Math.max(maximum, active);
+            try {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              return await nativeRead();
+            } finally {
+              active--;
+            }
+          },
+        });
+        return part;
+      },
+    });
+    const movie = {
+      given: bytes.slice(),
+      gaps: new Float64Array(0),
+      joins: [],
+      restoreWhole: () => bytes.slice(),
+      missing: Float64Array.from([0, bytes.length]),
+    };
+    const progress: { stage: string; loaded: number; total: number }[] = [];
+
+    const result = await movieEntropy(file, movie, 64, () => 1, {
+      onProgress: (value: (typeof progress)[number]) => progress.push(value),
+    });
+
+    expect(result.values.length).toBe(64);
+    expect(maximum).toBeLessThanOrEqual(8);
+    expect(progress.at(-1)).toMatchObject({ stage: "entropy", loaded: 64, total: 64 });
+  });
+
+  it("stops scheduling entropy samples after a range read fails", async () => {
+    const bytes = new Uint8Array(4 << 20).fill(7);
+    const blob = new Blob([bytes as BlobPart]);
+    const nativeSlice = blob.slice.bind(blob);
+    let reads = 0;
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const file = Object.assign(blob, {
+      slice(start = 0, end = blob.size, contentType?: string) {
+        reads++;
+        const part = nativeSlice(start, end, contentType);
+        Object.defineProperty(part, "arrayBuffer", {
+          value: async () => {
+            if (reads === 1) {
+              setTimeout(release, 0);
+              throw new Error("range read failed");
+            }
+            await blocked;
+            return new ArrayBuffer(end - start);
+          },
+        });
+        return part;
+      },
+    });
+    const movie = {
+      given: bytes.slice(),
+      gaps: new Float64Array(0),
+      joins: [],
+      restoreWhole: () => bytes.slice(),
+      missing: Float64Array.from([0, bytes.length]),
+    };
+
+    try {
+      const reading = movieEntropy(file, movie, 64, () => 1);
+      await expect(reading).rejects.toThrow("range read failed");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(reads).toBeLessThanOrEqual(8);
+    } finally {
+      release();
+    }
   });
 
   it("leaves small movies and other files whole", async () => {
@@ -146,6 +411,25 @@ group("bytes not read yet", () => {
       [0, 100],
       [200_100, 300_000],
     ]);
+  });
+
+  it("looks up missing ranges correctly across a large sparse movie map", () => {
+    const count = 20_000;
+    const stride = 2 * 64 * 1024;
+    const ranges = new Float64Array(count * 2);
+    for (let i = 0; i < count; i++) {
+      ranges[i * 2] = i * stride + 17;
+      ranges[i * 2 + 1] = 11;
+    }
+    const missing = new Missing(ranges);
+    const start = (count - 1) * stride + 17;
+
+    expect(missing.has(start)).toBe(false);
+    expect(missing.has(start - 1)).toBe(true);
+    expect(missing.has(start + 11)).toBe(true);
+    expect(missing.wanted(start, start + 11)).toEqual([[start, start + 11]]);
+    missing.filled([[start, start + 11]]);
+    expect(missing.has(start)).toBe(true);
   });
 });
 
