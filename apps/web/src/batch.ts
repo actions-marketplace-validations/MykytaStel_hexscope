@@ -32,6 +32,9 @@ export interface BatchItem {
 
 /** Whether a file has something a clean copy takes out. */
 export function cleanable(i: BatchItem): boolean {
+  // These formats can expose findings, but the core does not make a clean
+  // copy of the file itself. Attachments can be opened and cleaned separately.
+  if (i.format && ["unknown", "eml", "msg", "mp3", "flac", "ogg"].includes(i.format)) return false;
   return i.state === "done" && (i.reveals.length > 0 || i.lines.some((l) => l.kind === "hidden"));
 }
 
@@ -42,6 +45,7 @@ export interface BatchSummary {
   busy: boolean;
   revealing: number;
   damaged: number;
+  incomplete: number;
   hidden: number;
   flagged: number;
   dangerous: boolean;
@@ -56,6 +60,7 @@ interface BatchItemSummary {
   settled: boolean;
   reveals: boolean;
   damaged: boolean;
+  incomplete: boolean;
   hidden: boolean;
   flagged: boolean;
   dangerous: boolean;
@@ -69,8 +74,12 @@ function summarizeBatchItem(item: BatchItem): BatchItemSummary {
   let hasDamage = false;
   let hasHidden = false;
   let hasMisnamed = false;
+  let hasIncomplete = false;
   for (const line of item.lines) {
-    if (line.kind === "unknown") hasUnknownOrDamage = true;
+    if (line.kind === "unknown" || line.kind === "warning") {
+      hasUnknownOrDamage = true;
+      hasIncomplete = true;
+    }
     if (line.kind === "damage") {
       hasUnknownOrDamage = true;
       hasDamage = true;
@@ -82,12 +91,13 @@ function summarizeBatchItem(item: BatchItem): BatchItemSummary {
   return {
     settled: item.state === "done" || failed,
     reveals,
-    damaged: failed || hasDamage,
+    damaged: hasDamage,
+    incomplete: failed || hasIncomplete,
     hidden: hasHidden,
     flagged: hasUnknownOrDamage || failed || item.headline?.tone === "danger" || item.headline?.tone === "warning",
     dangerous: failed || item.headline?.tone === "danger",
-    problem: failed || hasDamage || hasHidden || hasMisnamed,
-    canClean: item.state === "done" && (reveals || hasHidden),
+    problem: failed || hasDamage || hasHidden || hasMisnamed || hasIncomplete,
+    canClean: cleanable(item),
   };
 }
 
@@ -98,6 +108,7 @@ export function summarizeBatch(items: BatchItem[], show: BatchShow, visibleLimit
     busy: false,
     revealing: 0,
     damaged: 0,
+    incomplete: 0,
     hidden: 0,
     flagged: 0,
     dangerous: false,
@@ -114,6 +125,7 @@ export function summarizeBatch(items: BatchItem[], show: BatchShow, visibleLimit
     if (facts.settled) summary.settled++;
     if (facts.reveals) summary.revealing++;
     if (facts.damaged) summary.damaged++;
+    if (facts.incomplete) summary.incomplete++;
     if (facts.hidden) summary.hidden++;
     if (facts.flagged) {
       summary.flagged++;
@@ -169,6 +181,7 @@ function tags(item: BatchItem): HTMLElement[] {
   if (item.copyStatus) out.push(el("span", "tag", item.copyStatus));
   const has = (k: VerdictLine["kind"]) => item.lines.some((l) => l.kind === k);
   if (has("unknown")) out.push(el("span", "tag is-unknown", "Not a format hexscope reads"));
+  if (has("warning")) out.push(el("span", "tag is-unknown", "Partial check"));
   if (has("damage")) out.push(el("span", "tag is-damage", "Damaged"));
   if (has("misnamed")) out.push(el("span", "tag is-oddity", "Wrong extension"));
   if (has("hidden")) out.push(el("span", "tag is-hidden", "Something hidden"));
@@ -261,6 +274,7 @@ export class BatchView {
         totals.revealing ? `${totals.revealing} ${totals.revealing === 1 ? "reveals" : "reveal"} something about you` : "",
         totals.hidden ? `${totals.hidden} ${totals.hidden === 1 ? "hides" : "hide"} something` : "",
         totals.damaged ? `${totals.damaged} damaged` : "",
+        totals.incomplete ? `${totals.incomplete} not fully checked` : "",
       ].filter(Boolean);
       // Each part its own text, so each is translated on its own.
       if (parts.length) summary.append(...parts.flatMap((part, i) => [...(i ? [" · "] : []), el("span", undefined, part)]), ".");
@@ -332,7 +346,7 @@ export class BatchView {
     const filters: [BatchShow, string, number][] = [
       ["all", "All", items.length],
       ["reveals", "Give something away", totals.revealing],
-      ["problems", "Damaged or hiding something", totals.problemCount],
+      ["problems", "Needs attention", totals.problemCount],
     ];
     const bar = el("div", "batch-filter");
     bar.setAttribute("role", "group");

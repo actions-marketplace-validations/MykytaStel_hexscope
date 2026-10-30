@@ -34,6 +34,55 @@ async function openFilm(page: Page, orientation = 1): Promise<void> {
   await expect(page.locator(".film-lab")).toHaveAttribute("data-state", "ready");
 }
 
+test("a film clue offers a direct path from the answer to Film Lab", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("hexscope.language", "uk");
+    localStorage.setItem("hexscope.tour", "done");
+  });
+  await page.goto("./");
+  await page.locator("#picker-empty").setInputFiles(new URL("../public/samples/film-negative.png", import.meta.url).pathname);
+  const shortcut = page.getByRole("button", { name: "Відкрити лабораторію плівки" });
+  await expect(shortcut).toBeVisible();
+  await shortcut.click();
+  await expect(page.locator(".film-lab-entry")).toHaveAttribute("open", "");
+  await expect(page.locator(".film-lab")).toHaveAttribute("data-state", "ready");
+  await page.getByRole("button", { name: "Перейти до налаштувань" }).click();
+  await expect(page.getByLabel("Тип скану")).toBeFocused();
+  await page.getByRole("button", { name: "Перейти до створення копії" }).click();
+  await expect(page.getByRole("button", { name: "Створити JPEG-копію" })).toBeFocused();
+});
+
+test("on a phone, compare one image at a time and keep adjustments when switching", async ({ page }, info) => {
+  test.skip(info.project.name !== "phone", "the compact comparison is for phones");
+  await openFilm(page);
+  const lab = page.locator(".film-lab");
+  const original = lab.getByRole("button", { name: "Original", exact: true });
+  const preview = lab.getByRole("button", { name: "Preview", exact: true });
+  for (const width of [320, 375, 600]) {
+    await page.setViewportSize({ width, height: 700 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+    expect((await original.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    expect((await preview.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  }
+  await expect(preview).toHaveAttribute("aria-pressed", "true");
+  await expect(lab.locator(".film-lab-preview")).toBeVisible();
+  await expect(lab.locator(".film-lab-source")).toBeHidden();
+  await lab.getByLabel("Trim left (%)").fill("10");
+  await expect(lab).toHaveAttribute("data-state", "ready");
+  await original.click();
+  await expect(original).toHaveAttribute("aria-pressed", "true");
+  await expect(lab.locator(".film-lab-source")).toBeVisible();
+  await expect(lab.locator(".film-lab-preview")).toBeHidden();
+  await preview.click();
+  await expect(lab.getByLabel("Trim left (%)")).toHaveValue("10");
+  await lab.getByLabel("Scan type").selectOption("color-negative");
+  await lab.getByRole("button", { name: "Pick unexposed film" }).click();
+  await expect(original).toHaveAttribute("aria-pressed", "true");
+  await expect(lab.locator(".film-lab-source")).toBeVisible();
+  await preview.click();
+  await expect(lab.getByRole("button", { name: "Pick unexposed film" })).toHaveAttribute("aria-pressed", "false");
+});
+
 test("film lab crops, converts, reads the actual output and downloads locally while offline", async ({ page, context }) => {
   await openFilm(page);
   const lab = page.locator(".film-lab");

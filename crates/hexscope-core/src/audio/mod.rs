@@ -342,6 +342,89 @@ mod tests {
     }
 
     #[test]
+    fn ape_metadata_after_audio_is_not_mistaken_for_a_complete_check() {
+        for id3v1 in [false, true] {
+            let mut bytes = vec![0xff, 0xfb, 0x90, 0x64];
+            bytes.extend_from_slice(b"APETAGEX");
+            bytes.extend_from_slice(&2000u32.to_le_bytes());
+            bytes.extend_from_slice(&32u32.to_le_bytes());
+            bytes.extend_from_slice(&[0; 16]);
+            if id3v1 {
+                bytes.extend_from_slice(b"TAG");
+                bytes.extend_from_slice(&[0; 125]);
+            }
+            let doc = parse_mp3(&bytes);
+            assert!(!doc.metadata_complete);
+            let warning = doc
+                .tree
+                .nodes()
+                .iter()
+                .find(|n| n.label == "APE audio metadata is partially inspected")
+                .unwrap();
+            assert_eq!(warning.range.start, 4);
+            assert_eq!(warning.range.len, 32);
+            assert!(
+                doc.tree
+                    .nodes()
+                    .iter()
+                    .any(|n| n.label == "audio frames (not decoded)" && n.range.len == 4)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_ape_size_still_marks_metadata_incomplete() {
+        let mut bytes = vec![0xff, 0xfb, 0x90, 0x64];
+        bytes.extend_from_slice(b"APETAGEX");
+        bytes.extend_from_slice(&[0; 24]);
+        assert!(!parse_mp3(&bytes).metadata_complete);
+    }
+
+    #[test]
+    fn reads_bounded_ape_text_but_keeps_the_overall_check_partial() {
+        let mut bytes = vec![0xff, 0xfb, 0x90, 0x64];
+        let mut item = Vec::new();
+        item.extend_from_slice(&5u32.to_le_bytes());
+        item.extend_from_slice(&0u32.to_le_bytes());
+        item.extend_from_slice(b"Artist\0Alice");
+        bytes.extend_from_slice(&item);
+        bytes.extend_from_slice(b"APETAGEX");
+        bytes.extend_from_slice(&2000u32.to_le_bytes());
+        bytes.extend_from_slice(&((item.len() + 32) as u32).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 12]);
+        let doc = parse_mp3(&bytes);
+        assert_eq!(values(&doc, "artist"), ["Alice"]);
+        assert!(!doc.metadata_complete);
+        let fact = &doc.facts[0];
+        assert_eq!(
+            &bytes[doc.tree.get(fact.node).range.start as usize..][..5],
+            b"Alice"
+        );
+    }
+
+    #[test]
+    fn ape_binary_and_invalid_text_are_not_reported_as_text_facts() {
+        for (flags, value) in [(2u32, b"Alice".as_slice()), (0, b"\xfflice".as_slice())] {
+            let mut bytes = vec![0xff, 0xfb, 0x90, 0x64];
+            let mut item = Vec::new();
+            item.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            item.extend_from_slice(&flags.to_le_bytes());
+            item.extend_from_slice(b"Artist\0");
+            item.extend_from_slice(value);
+            bytes.extend_from_slice(&item);
+            bytes.extend_from_slice(b"APETAGEX");
+            bytes.extend_from_slice(&2000u32.to_le_bytes());
+            bytes.extend_from_slice(&((item.len() + 32) as u32).to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&[0; 12]);
+            let doc = parse_mp3(&bytes);
+            assert!(doc.facts.is_empty());
+            assert!(!doc.metadata_complete);
+        }
+    }
+
+    #[test]
     fn reads_flac_vorbis_comments_and_preserves_unknown_duplicates() {
         let bytes = flac(&[
             b"TITLE=Sample",
