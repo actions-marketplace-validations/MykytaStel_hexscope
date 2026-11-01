@@ -170,6 +170,25 @@ const SVG: &[&str] = &[
     "embedded",
     "photoplace",
 ];
+/// MP3 and FLAC clean copies remove recognized metadata blocks whole. Only
+/// facts both readers recognize can be confirmed; unknown metadata stays
+/// unchecked and blocks a FLAC copy.
+const AUDIO: &[&str] = &[
+    "title",
+    "artist",
+    "album",
+    "album-artist",
+    "year",
+    "track",
+    "disc",
+    "genre",
+    "composer",
+    "encoder",
+    "organization",
+    "location",
+    "comment",
+    "audio-tag",
+];
 
 /// Canonical clean-copy removal contract shared by the core, Web, and CLI:
 /// each format and the file-scoped findings it covers. Reports outside these
@@ -186,6 +205,8 @@ pub const VERIFIED_REMOVAL: &[(&str, &[&str])] = &[
     ("office97", OFFICE97),
     ("rtf", RTF),
     ("svg", SVG),
+    ("mp3", AUDIO),
+    ("flac", AUDIO),
 ];
 
 /// Every covered combination, one by one.
@@ -609,7 +630,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             tuples.len(),
-            8 + 10 + 8 + 7 + 7 + 5 + 13 + 28 + 15 + 20 + 11
+            8 + 10 + 8 + 7 + 7 + 5 + 13 + 28 + 15 + 20 + 11 + 14 + 14
         );
         for (index, (format, kind, scope)) in tuples.iter().enumerate() {
             assert!(covered(format, kind, scope));

@@ -17,6 +17,7 @@ import { headline } from "./headline";
 import { BatchController, BatchView, type BatchAnalysis } from "./batch";
 import { WorkspaceController, type MovieProgress, type WorkspaceLevel } from "./workspace-controller";
 import { categories } from "./share";
+import { hasCleanableAudioTags } from "./audio-clean";
 import { dismissTour, maybeTour, resetTour } from "./tour";
 import { SearchBar } from "./search";
 import { announce } from "./announce";
@@ -982,6 +983,7 @@ async function analyzeBatchFile(file: File, signal: AbortSignal): Promise<BatchA
   return {
     kind: kindOf(parsed),
     format: parsed.file.format,
+    hasRemovableMetadata: hasCleanableAudioTags(parsed.file.format, parsed.file.labels, parsed.file.metadataComplete),
     lines: verdict(parsed),
     headline: headline(parsed),
     reveals: categories(parsed),

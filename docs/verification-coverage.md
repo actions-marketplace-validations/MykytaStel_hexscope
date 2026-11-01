@@ -31,13 +31,19 @@ file, such as a photo in a document, is not covered.
 | `office97` | title, subject, author, editor, keywords, description, category, created, modified, revisions, company, manager, application, editing, template |
 | `rtf` | title, subject, author, editor, manager, company, category, keywords, description, created, modified, printed, revisions, editing, application, template, custom, tracked, deleted, comments |
 | `svg` | original, links, software, author, company, title, created, description, keywords, embedded, photoplace |
+| `mp3` | title, artist, album, album-artist, year, track, disc, genre, composer, encoder, organization, location, comment, audio-tag |
+| `flac` | title, artist, album, album-artist, year, track, disc, genre, composer, encoder, organization, location, comment, audio-tag |
 <!-- coverage:end -->
 
 Why each row can be trusted:
 
 - **Photos** (JPEG, PNG, WebP, HEIC): the copy drops or blanks EXIF, XMP,
   IPTC, the maker's notes and comments as a whole, so no copy of these kinds
-  can stay in another block.
+  can stay in another block. One bounded JPEG MPF HDR gain map is parsed with
+  the main picture; its personal metadata is removed in place while recognized
+  Ultra HDR or ISO 21496-1 settings and both pictures stay. Unknown required
+  gain-map metadata makes cleaning refuse the copy. The fixture verifies the
+  bytes and read-back results; rendering on a physical iPhone is still open.
 - **Videos** (MP4, MOV, M4A): the copy blanks every metadata item where it
   lies and zeroes the creation and change times of every header.
 - **PDF**: the copy is written anew without the Info dictionary and XMP, and
@@ -75,6 +81,16 @@ Why each row can be trusted:
   computer keeps only its file name, and a photo embedded as base64 is
   cleaned as a photo of its own. Scripts are the drawing's and stay; they
   are named, not removed.
+- **MP3**: leading ID3v2 and trailing APE, ID3v1 Plus and ID3v1 tags are
+  removed as whole blocks; compressed MPEG frames are copied byte for byte. Only listed
+  metadata kinds can be confirmed, and only when both parses are complete.
+- **FLAC**: Vorbis comments and whole picture blocks are removed; STREAMINFO,
+  padding, seek tables and compressed audio frames stay byte for byte. A
+  complete parse is required, so uninspected application, cue sheet or
+  reserved blocks prevent a clean copy. Only listed metadata kinds can be
+  confirmed after a complete read-back.
+- **Ogg**: read-only. Page checksums are checked only on pages read to inspect
+  codec headers and comments; later audio pages are not decoded or verified.
 - **Every other format, finding, or scope**: none. A finding still observed in
   the copy is **Still present**; absent but uncovered, it is **Not checked**,
   as is anything from an incomplete read.

@@ -84,6 +84,114 @@ fn check_reads_audio_tags_and_reports_uninspected_id3_metadata() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn clean_mp3_copies_audio_frames_and_verifies_the_removed_title() {
+    let dir = std::env::temp_dir().join(format!("hexscope-clean-mp3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("song.mp3");
+    let output = dir.join("song-clean.mp3");
+    let mut body = b"TIT2".to_vec();
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(&[0, 0, 0]);
+    body.extend_from_slice(b"song");
+    let size = body.len();
+    let mut mp3 = b"ID3\x03\0\0".to_vec();
+    mp3.extend_from_slice(&[
+        ((size >> 21) & 0x7f) as u8,
+        ((size >> 14) & 0x7f) as u8,
+        ((size >> 7) & 0x7f) as u8,
+        (size & 0x7f) as u8,
+    ]);
+    mp3.extend_from_slice(&body);
+    let audio = [0xff, 0xfb, 0x90, 0x64, 1, 2, 3, 4];
+    mp3.extend_from_slice(&audio);
+    std::fs::write(&source, mp3).unwrap();
+
+    let (code, out, err) = run(&[
+        "clean",
+        "--verify",
+        "--json",
+        "--out",
+        output.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{out}{err}");
+    let receipt: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(receipt["operation_state"], "written");
+    assert!(receipt["removed"].to_string().contains("title"));
+    assert_eq!(receipt["unchecked"].as_array().unwrap().len(), 0);
+    assert_eq!(std::fs::read(output).unwrap(), audio);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn clean_flac_removes_vorbis_comments_and_verifies_the_retained_stream() {
+    let dir = std::env::temp_dir().join(format!("hexscope-clean-flac-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("song.flac");
+    let output = dir.join("song-clean.flac");
+
+    let vendor = b"test encoder";
+    let field = b"TITLE=Song";
+    let mut comments = Vec::new();
+    comments.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    comments.extend_from_slice(vendor);
+    comments.extend_from_slice(&1u32.to_le_bytes());
+    comments.extend_from_slice(&(field.len() as u32).to_le_bytes());
+    comments.extend_from_slice(field);
+    let frames = [0xff, 0xf8, 0x69, 0x08, 1, 2, 3, 4];
+    let mut flac = b"fLaC".to_vec();
+    flac.extend_from_slice(&[0, 0, 0, 34]);
+    flac.extend_from_slice(&[0; 34]);
+    flac.push(0x04);
+    flac.extend_from_slice(&[
+        ((comments.len() >> 16) & 0xff) as u8,
+        ((comments.len() >> 8) & 0xff) as u8,
+        (comments.len() & 0xff) as u8,
+    ]);
+    flac.extend_from_slice(&comments);
+    let picture = [0, 0, 0, 3, b'P', b'N', b'G', 0, 0, 0, 0, 1, 2, 3];
+    flac.push(0x86);
+    flac.extend_from_slice(&[
+        ((picture.len() >> 16) & 0xff) as u8,
+        ((picture.len() >> 8) & 0xff) as u8,
+        (picture.len() & 0xff) as u8,
+    ]);
+    flac.extend_from_slice(&picture);
+    flac.extend_from_slice(&frames);
+    std::fs::write(&source, flac).unwrap();
+
+    let (code, out, err) = run(&[
+        "clean",
+        "--verify",
+        "--json",
+        "--out",
+        output.to_str().unwrap(),
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{out}{err}");
+    let receipt: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(receipt["operation_state"], "written");
+    assert!(receipt["removed"].to_string().contains("title"));
+    assert_eq!(receipt["unchecked"].as_array().unwrap().len(), 0);
+    let cleaned = std::fs::read(output).unwrap();
+    assert!(
+        cleaned.ends_with(&frames),
+        "compressed audio frames stay byte for byte"
+    );
+    let parsed = hexscope_core::audio::parse(&cleaned).unwrap();
+    assert!(
+        parsed
+            .tree
+            .nodes()
+            .iter()
+            .all(|node| node.label != "FLAC picture block")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     hexscope_core::crypto::sha2::sha256(bytes)
         .iter()

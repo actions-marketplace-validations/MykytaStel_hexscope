@@ -78,7 +78,7 @@ impl CleanError {
                 "parts of it are compressed in a way hexscope does not read, and a copy could lose them"
             }
             CleanError::Unsupported => {
-                "hexscope cleans PNG, JPEG, HEIC, AVIF, WebP, GIF and TIFF images, SVG drawings, MP4 and QuickTime videos, PDFs, Office and LibreOffice documents, RTF, old Word, Excel and PowerPoint files, and WebAssembly modules only"
+                "hexscope cleans PNG, JPEG, HEIC, AVIF, WebP, GIF and TIFF images, SVG drawings, MP3 tags, MP4 and QuickTime videos, PDFs, Office and LibreOffice documents, RTF, old Word, Excel and PowerPoint files, and WebAssembly modules only"
             }
             CleanError::PictureUnderBox => {
                 "a box covers part of a picture on the page that hexscope cannot edit — a JBIG2, CCITT or JPEG 2000 scan, or one too large — and the picture would still show what is under the box"
@@ -117,6 +117,12 @@ pub fn clean_with(data: &[u8], options: CleanOptions) -> Result<Cleaned, CleanEr
         Document::Zip(doc) if cfg!(feature = "office") => clean_zip(data, &doc, options, false),
         Document::Pdf(_) if cfg!(feature = "pdf") => crate::pdf::clean::clean_pdf(data),
         Document::Video(doc) => clean_video(data, &doc),
+        #[cfg(feature = "audio")]
+        Document::Audio(doc) if doc.format == crate::audio::AudioFormat::Mp3 => clean_mp3(data),
+        #[cfg(feature = "audio")]
+        Document::Audio(doc) if doc.format == crate::audio::AudioFormat::Flac => {
+            clean_flac(data, &doc)
+        }
         Document::Wasm(doc) if cfg!(feature = "module") => clean_wasm(data, &doc),
         Document::Cfb(doc) if cfg!(feature = "office") => clean_cfb(data, &doc),
         Document::Rtf(doc) if cfg!(feature = "office") => clean_rtf(data, &doc),
@@ -125,6 +131,160 @@ pub fn clean_with(data: &[u8], options: CleanOptions) -> Result<Cleaned, CleanEr
     }?;
     cleaned.removed = merged(cleaned.removed);
     Ok(cleaned)
+}
+
+/// Removes only the bounded ID3v2, APE and ID3v1 tags at an MP3's edges.
+/// MPEG frames are copied byte for byte and never decoded or re-encoded.
+#[cfg(feature = "audio")]
+fn clean_mp3(data: &[u8]) -> Result<Cleaned, CleanError> {
+    let ranges = crate::audio::removable_tag_ranges(data).ok_or(CleanError::Damaged)?;
+    if ranges.is_empty() {
+        return Err(CleanError::NothingToRemove);
+    }
+    let mut bytes = Vec::with_capacity(data.len());
+    let mut removed = Vec::with_capacity(ranges.len());
+    let mut at = 0u64;
+    for (range, what) in ranges {
+        let end = range.end();
+        if range.start < at || end > data.len() as u64 {
+            return Err(CleanError::Damaged);
+        }
+        bytes.extend_from_slice(
+            data.get(at as usize..range.start as usize)
+                .ok_or(CleanError::Damaged)?,
+        );
+        removed.push(Removed {
+            what: what.into(),
+            bytes: range.len,
+        });
+        at = end;
+    }
+    bytes.extend_from_slice(data.get(at as usize..).ok_or(CleanError::Damaged)?);
+    Ok(Cleaned {
+        bytes,
+        removed,
+        orientation_kept: None,
+    })
+}
+
+/// Removes FLAC Vorbis comments and complete picture blocks while leaving
+/// every retained metadata block and compressed audio frame byte for byte intact.
+#[cfg(feature = "audio")]
+fn clean_flac(data: &[u8], doc: &crate::audio::AudioDocument) -> Result<Cleaned, CleanError> {
+    use crate::audio::AudioFormat;
+
+    if doc.format != AudioFormat::Flac || !data.starts_with(b"fLaC") {
+        return Err(CleanError::Damaged);
+    }
+    if doc
+        .tree
+        .nodes()
+        .iter()
+        .any(|node| node.kind == NodeKind::Error)
+    {
+        return Err(CleanError::Damaged);
+    }
+    if !doc.metadata_complete {
+        return Err(CleanError::Unsupported);
+    }
+    let root = doc.tree.root().ok_or(CleanError::Damaged)?;
+    let children = &doc.tree.get(root).children;
+    let blocks = children
+        .iter()
+        .map(|&id| doc.tree.get(id))
+        .filter(|node| node.label.starts_with("FLAC ") && node.label.ends_with(" block"))
+        .collect::<Vec<_>>();
+    let comments = blocks
+        .iter()
+        .filter(|node| node.label == "FLAC Vorbis comments block")
+        .count();
+    let pictures = blocks
+        .iter()
+        .filter(|node| node.label == "FLAC picture block")
+        .count();
+    if comments == 0 && pictures == 0 {
+        return Err(CleanError::NothingToRemove);
+    }
+    if comments > 1 {
+        return Err(CleanError::Damaged);
+    }
+
+    let frame = children
+        .iter()
+        .map(|&id| doc.tree.get(id))
+        .find(|node| node.label == "audio frames (not decoded)")
+        .ok_or(CleanError::Damaged)?;
+    if frame.range.len == 0 || frame.range.end() != data.len() as u64 {
+        return Err(CleanError::Damaged);
+    }
+
+    let mut cursor = 4u64;
+    for block in &blocks {
+        if block.range.start != cursor
+            || block.range.len < 4
+            || block.range.end() > frame.range.start
+        {
+            return Err(CleanError::Damaged);
+        }
+        cursor = block.range.end();
+    }
+    if cursor != frame.range.start {
+        return Err(CleanError::Damaged);
+    }
+
+    let retained = blocks
+        .iter()
+        .copied()
+        .filter(|node| {
+            node.label != "FLAC Vorbis comments block" && node.label != "FLAC picture block"
+        })
+        .collect::<Vec<_>>();
+    if retained.is_empty() || retained[0].label != "FLAC STREAMINFO block" {
+        return Err(CleanError::Damaged);
+    }
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(b"fLaC");
+    for (index, block) in retained.iter().enumerate() {
+        let start = usize::try_from(block.range.start).map_err(|_| CleanError::Damaged)?;
+        let end = usize::try_from(block.range.end()).map_err(|_| CleanError::Damaged)?;
+        let bytes = data.get(start..end).ok_or(CleanError::Damaged)?;
+        let mut copied = bytes.to_vec();
+        copied[0] = (copied[0] & 0x7f) | if index + 1 == retained.len() { 0x80 } else { 0 };
+        out.extend_from_slice(&copied);
+    }
+    out.extend_from_slice(
+        data.get(frame.range.start as usize..)
+            .ok_or(CleanError::Damaged)?,
+    );
+
+    let mut removed = Vec::new();
+    if comments == 1 {
+        removed.push(Removed {
+            what: "FLAC Vorbis comments".into(),
+            bytes: blocks
+                .iter()
+                .find(|node| node.label == "FLAC Vorbis comments block")
+                .ok_or(CleanError::Damaged)?
+                .range
+                .len,
+        });
+    }
+    if pictures > 0 {
+        removed.push(Removed {
+            what: "FLAC pictures".into(),
+            bytes: blocks
+                .iter()
+                .filter(|node| node.label == "FLAC picture block")
+                .map(|node| node.range.len)
+                .sum(),
+        });
+    }
+
+    Ok(Cleaned {
+        bytes: out,
+        removed,
+        orientation_kept: None,
+    })
 }
 
 /// Two blocks of the same kind, such as a second EXIF segment, are one line.
@@ -353,6 +513,18 @@ fn clean_jpeg(data: &[u8], doc: &JpegDocument) -> Result<Cleaned, CleanError> {
     if top.first().map(|&c| tree.get(c).label.as_str()) != Some("SOI") {
         return Err(CleanError::Damaged);
     }
+    if top
+        .iter()
+        .any(|&id| tree.get(id).label == crate::jpeg::LISTED_PICTURE)
+    {
+        #[cfg(feature = "hdr")]
+        if top.iter().any(|&id| is_hdr_gain_map(tree, id)) {
+            return clean_hdr_jpeg(data, doc, root, top);
+        }
+        // A listed secondary image is part of the photo. Without recognized
+        // gain-map metadata, do not turn it into blank bytes or lose its role.
+        return Err(CleanError::Unsupported);
+    }
 
     let mut cut: Vec<ByteRange> = Vec::new();
     let mut removed = Vec::new();
@@ -408,6 +580,367 @@ fn clean_jpeg(data: &[u8], doc: &JpegDocument) -> Result<Cleaned, CleanError> {
         removed,
         orientation_kept: orientation,
     })
+}
+
+#[cfg(feature = "hdr")]
+const XMP_ID: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+#[cfg(feature = "hdr")]
+const ISO_GAIN_MAP_ID: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0";
+
+#[cfg(feature = "hdr")]
+fn is_hdr_gain_map(tree: &crate::model::ParseTree, id: u32) -> bool {
+    let node = tree.get(id);
+    node.label == crate::jpeg::LISTED_PICTURE
+        && matches!(node.value, Some(crate::model::Value::Text(ref kind)) if kind == "HDR gain map")
+}
+
+#[cfg(feature = "hdr")]
+fn xmp_info(
+    data: &[u8],
+    range: ByteRange,
+    expected_map_len: Option<u64>,
+) -> crate::jpeg::HdrXmpInfo {
+    let Some(segment) = data.get(range.start as usize..range.end() as usize) else {
+        return crate::jpeg::HdrXmpInfo::default();
+    };
+    let Some(payload) = segment.get(4..) else {
+        return crate::jpeg::HdrXmpInfo::default();
+    };
+    let Some(packet) = payload.strip_prefix(XMP_ID) else {
+        return crate::jpeg::HdrXmpInfo::default();
+    };
+    crate::jpeg::inspect_hdr_xmp(packet, expected_map_len)
+}
+
+#[cfg(feature = "hdr")]
+fn has_container_directory(data: &[u8], range: ByteRange) -> bool {
+    let needle = b"Container:Directory";
+    data.get(range.start as usize..range.end() as usize)
+        .is_some_and(|segment| segment.windows(needle.len()).any(|w| w == needle))
+}
+
+#[cfg(feature = "hdr")]
+fn has_hdr_gain_map_fields(data: &[u8], range: ByteRange) -> bool {
+    let Some(segment) = data.get(range.start as usize..range.end() as usize) else {
+        return false;
+    };
+    [
+        b"HDRGainMap".as_slice(),
+        b"hdrgm:".as_slice(),
+        b"urn:iso:std:iso:ts:21496".as_slice(),
+    ]
+    .iter()
+    .any(|needle| {
+        segment
+            .windows(needle.len())
+            .any(|window| window == *needle)
+    })
+}
+
+/// ISO 21496-1's primary-image marker contains only the version fields; the
+/// gain-map JPEG carries those fields and the encoded gain-map parameters.
+#[cfg(feature = "hdr")]
+fn valid_iso_gain_map_segment(data: &[u8], range: ByteRange, require_values: bool) -> bool {
+    let Some(segment) = data.get(range.start as usize..range.end() as usize) else {
+        return false;
+    };
+    let Some(payload) = segment.get(4..) else {
+        return false;
+    };
+    let Some(metadata) = payload.strip_prefix(ISO_GAIN_MAP_ID) else {
+        return false;
+    };
+    valid_iso_gain_map_metadata(metadata, require_values)
+}
+
+/// ISO 21496-1 version 0 metadata has an exact layout. The primary image's
+/// marker contains only the two version fields; the gain-map image carries a
+/// flags byte followed by one or three channels of rational values.
+#[cfg(feature = "hdr")]
+fn valid_iso_gain_map_metadata(metadata: &[u8], require_values: bool) -> bool {
+    if metadata.len() == 4 {
+        return !require_values && metadata == [0, 0, 0, 0];
+    }
+    if !require_values || metadata.len() < 5 || metadata[..4] != [0, 0, 0, 0] {
+        return false;
+    }
+    let flags = metadata[4];
+    // Version 0 has four defined flag bits. The direction bit is defined but
+    // unsupported by the decoder; reserved bits and future versions fail closed.
+    if flags & 0xF0 != 0 || flags & 0x04 != 0 {
+        return false;
+    }
+    let channels = if flags & 0x01 != 0 { 3 } else { 1 };
+    let common_denominator = flags & 0x08 != 0;
+    let fields_start = if common_denominator { 17 } else { 21 };
+    let field_bytes = if common_denominator { 20 } else { 40 };
+    if metadata.len() != fields_start + channels * field_bytes {
+        return false;
+    }
+    if common_denominator {
+        return nonzero_be_u32(metadata, 5);
+    }
+    for channel in 0..channels {
+        let start = fields_start + channel * field_bytes;
+        for denominator in [start + 4, start + 12, start + 20, start + 28, start + 36] {
+            if !nonzero_be_u32(metadata, denominator) {
+                return false;
+            }
+        }
+    }
+    nonzero_be_u32(metadata, 9) && nonzero_be_u32(metadata, 17)
+}
+
+#[cfg(feature = "hdr")]
+fn nonzero_be_u32(bytes: &[u8], at: usize) -> bool {
+    bytes.get(at..at + 4).is_some_and(|raw| raw != [0, 0, 0, 0])
+}
+
+/// HDR JPEGs depend on offsets from their MPF marker to the appended gain map.
+/// Keep each segment's length fixed, blank personal metadata in place, and
+/// preserve only technical gain-map metadata that passed the strict XMP gate.
+#[cfg(feature = "hdr")]
+fn clean_hdr_jpeg(
+    data: &[u8],
+    doc: &JpegDocument,
+    _root: u32,
+    top: &[u32],
+) -> Result<Cleaned, CleanError> {
+    let tree = &doc.tree;
+    let maps: Vec<_> = top
+        .iter()
+        .map(|&id| tree.get(id))
+        .filter(|node| node.label == crate::jpeg::LISTED_PICTURE)
+        .collect();
+    let mpf_count = top
+        .iter()
+        .filter(|&&id| tree.get(id).label == "APP2 · MPF")
+        .count();
+    if maps.len() != 1 || mpf_count != 1 || doc.pictures.len() != 1 {
+        return Err(CleanError::Unsupported);
+    }
+    let map_node = maps[0];
+    let map_range = map_node.range;
+    if !is_hdr_gain_map(tree, map_node.id)
+        || doc.pictures[0] != map_range
+        || map_range.end() > data.len() as u64
+        || top
+            .iter()
+            .any(|&id| tree.get(id).label == "data after the end of the image")
+    {
+        return Err(CleanError::Unsupported);
+    }
+    let map_bytes = data
+        .get(map_range.start as usize..map_range.end() as usize)
+        .ok_or(CleanError::Damaged)?;
+    if map_bytes.len() as u64 > 64 * 1024 * 1024 {
+        return Err(CleanError::Unsupported);
+    }
+    let map_doc = crate::jpeg::parse_jpeg(map_bytes);
+    if map_doc.tree.nodes().iter().any(|node| {
+        node.kind == NodeKind::Error
+            || node.kind == NodeKind::Warning
+            || node.label == crate::jpeg::LISTED_PICTURE
+            || node.label == "data after the end of the image"
+    }) || !map_doc.pictures.is_empty()
+    {
+        return Err(CleanError::Damaged);
+    }
+    let map_root = map_doc.tree.root().ok_or(CleanError::Damaged)?;
+    let map_top = &map_doc.tree.get(map_root).children;
+    let has_map_iso = map_top.iter().any(|&id| {
+        let node = map_doc.tree.get(id);
+        node.label == "APP2 · ISO gain map"
+            && valid_iso_gain_map_segment(map_bytes, node.range, true)
+    });
+    let map_xmps: Vec<_> = map_top
+        .iter()
+        .map(|&id| map_doc.tree.get(id))
+        .filter(|node| node.label == "APP1 · XMP")
+        .collect();
+    let map_has_safe_xmp = map_xmps.iter().any(|node| {
+        let info = xmp_info(map_bytes, node.range, None);
+        info.safe && info.has_gain_map_metadata
+    });
+    if !has_map_iso && !map_has_safe_xmp {
+        return Err(CleanError::Unsupported);
+    }
+    for node in &map_xmps {
+        let info = xmp_info(map_bytes, node.range, None);
+        if !info.safe && has_container_directory(map_bytes, node.range) {
+            return Err(CleanError::Unsupported);
+        }
+        if !info.safe && !has_map_iso {
+            return Err(CleanError::Unsupported);
+        }
+    }
+
+    let primary_xmps: Vec<_> = top
+        .iter()
+        .map(|&id| tree.get(id))
+        .filter(|node| node.label == "APP1 · XMP")
+        .collect();
+    for node in &primary_xmps {
+        let info = xmp_info(data, node.range, Some(map_range.len));
+        if !info.safe
+            && (has_container_directory(data, node.range)
+                || has_hdr_gain_map_fields(data, node.range))
+        {
+            return Err(CleanError::Unsupported);
+        }
+    }
+
+    let orientation = doc.facts.orientation.filter(|&o| (2..=8).contains(&o));
+    let minimal_orientation = orientation.map(orientation_segment);
+    if let (Some(segment), Some(range)) = (
+        &minimal_orientation,
+        top.iter()
+            .find_map(|&id| (tree.get(id).label == "APP1 · EXIF").then_some(tree.get(id).range)),
+    ) && range.len < segment.len() as u64
+    {
+        return Err(CleanError::Unsupported);
+    }
+
+    let mut out = data.to_vec();
+    let mut removed = Vec::new();
+    for &id in top {
+        let node = tree.get(id);
+        if node.id == map_node.id {
+            let (sanitized, map_removed) = clean_hdr_gain_map(map_bytes, &map_doc, has_map_iso)?;
+            if sanitized.len() != map_bytes.len() {
+                return Err(CleanError::Damaged);
+            }
+            out.get_mut(map_range.start as usize..map_range.end() as usize)
+                .ok_or(CleanError::Damaged)?
+                .copy_from_slice(&sanitized);
+            removed.extend(map_removed);
+            continue;
+        }
+        if node.range.len == 0
+            || node.label == "SOI"
+            || node.label == "EOI"
+            || node.label == "APP2 · MPF"
+            || node.label == "APP2 · ISO gain map"
+            || jpeg_keeps(&node.label)
+        {
+            if node.label == "APP2 · ISO gain map"
+                && !valid_iso_gain_map_segment(data, node.range, false)
+            {
+                blank_jpeg_segment(&mut out, node.range)?;
+                removed.push(Removed {
+                    what: jpeg_what(&node.label),
+                    bytes: node.range.len,
+                });
+            }
+            continue;
+        }
+        if node.label == "data after the end of the image" {
+            return Err(CleanError::Unsupported);
+        }
+        if node.label == "APP1 · XMP" {
+            let info = xmp_info(data, node.range, Some(map_range.len));
+            if info.safe && (info.has_container_directory || info.has_gain_map_metadata) {
+                continue;
+            }
+        }
+        if node.label == "APP1 · EXIF" {
+            if let Some(segment) = &minimal_orientation {
+                write_orientation_in_segment(&mut out, data, node.range, segment)?;
+            } else {
+                blank_jpeg_segment(&mut out, node.range)?;
+            }
+        } else {
+            blank_jpeg_segment(&mut out, node.range)?;
+        }
+        removed.push(Removed {
+            what: jpeg_what(&node.label),
+            bytes: node.range.len,
+        });
+    }
+    if removed.is_empty() {
+        return Err(CleanError::NothingToRemove);
+    }
+    Ok(Cleaned {
+        bytes: out,
+        removed,
+        orientation_kept: orientation,
+    })
+}
+
+#[cfg(feature = "hdr")]
+fn clean_hdr_gain_map(
+    data: &[u8],
+    doc: &JpegDocument,
+    has_iso: bool,
+) -> Result<(Vec<u8>, Vec<Removed>), CleanError> {
+    let tree = &doc.tree;
+    let root = tree.root().ok_or(CleanError::Damaged)?;
+    let mut out = data.to_vec();
+    let mut removed = Vec::new();
+    for &id in &tree.get(root).children {
+        let node = tree.get(id);
+        if node.range.len == 0 || node.label == "SOI" || node.label == "EOI" {
+            continue;
+        }
+        if node.label == "APP2 · ISO gain map" {
+            if valid_iso_gain_map_segment(data, node.range, true) {
+                continue;
+            }
+        } else if node.label == "APP1 · XMP" {
+            let info = xmp_info(data, node.range, None);
+            if info.safe && info.has_gain_map_metadata {
+                continue;
+            }
+            if has_container_directory(data, node.range) || !has_iso {
+                return Err(CleanError::Unsupported);
+            }
+        } else if jpeg_keeps(&node.label) {
+            continue;
+        }
+        if node.label == "data after the end of the image"
+            || node.label == crate::jpeg::LISTED_PICTURE
+        {
+            return Err(CleanError::Unsupported);
+        }
+        blank_jpeg_segment(&mut out, node.range)?;
+        removed.push(Removed {
+            what: jpeg_what(&node.label),
+            bytes: node.range.len,
+        });
+    }
+    Ok((out, removed))
+}
+
+#[cfg(feature = "hdr")]
+fn blank_jpeg_segment(out: &mut [u8], range: ByteRange) -> Result<(), CleanError> {
+    let start = usize::try_from(range.start).map_err(|_| CleanError::Damaged)?;
+    let end = usize::try_from(range.end()).map_err(|_| CleanError::Damaged)?;
+    let payload = start.checked_add(4).ok_or(CleanError::Damaged)?;
+    out.get_mut(payload..end)
+        .ok_or(CleanError::Damaged)?
+        .fill(0);
+    Ok(())
+}
+
+#[cfg(feature = "hdr")]
+fn write_orientation_in_segment(
+    out: &mut [u8],
+    original: &[u8],
+    range: ByteRange,
+    orientation: &[u8],
+) -> Result<(), CleanError> {
+    let start = usize::try_from(range.start).map_err(|_| CleanError::Damaged)?;
+    let end = usize::try_from(range.end()).map_err(|_| CleanError::Damaged)?;
+    let room = out.get_mut(start..end).ok_or(CleanError::Damaged)?;
+    let source = original.get(start..start + 4).ok_or(CleanError::Damaged)?;
+    let length = [source[2], source[3]];
+    room.fill(0);
+    let minimal = room
+        .get_mut(..orientation.len())
+        .ok_or(CleanError::Damaged)?;
+    minimal.copy_from_slice(orientation);
+    minimal[2..4].copy_from_slice(&length);
+    Ok(())
 }
 
 /// Copies `data[from..to]`, writing the orientation block when the copy
@@ -1079,10 +1612,13 @@ mod tests {
 
     fn scan(bytes: &[u8]) -> Vec<u8> {
         let doc = parse_jpeg(bytes);
+        let root = doc.tree.root().unwrap();
         let n = doc
             .tree
-            .nodes()
+            .get(root)
+            .children
             .iter()
+            .map(|&id| doc.tree.get(id))
             .find(|n| n.label == "scan data")
             .unwrap();
         bytes[n.range.start as usize..n.range.end() as usize].to_vec()
@@ -1094,6 +1630,169 @@ mod tests {
             .filter(|n| matches!(n.kind, NodeKind::Warning | NodeKind::Error))
             .map(|n| n.label.clone())
             .collect()
+    }
+
+    #[cfg(feature = "audio")]
+    fn flac_with_metadata(
+        fields: Option<&[&[u8]]>,
+        extra: &[(u8, &[u8])],
+        frames: &[u8],
+    ) -> Vec<u8> {
+        let mut blocks = vec![(0u8, vec![0; 34])];
+        if let Some(fields) = fields {
+            let mut comments = Vec::new();
+            comments.extend_from_slice(&12u32.to_le_bytes());
+            comments.extend_from_slice(b"test encoder");
+            comments.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+            for field in fields {
+                comments.extend_from_slice(&(field.len() as u32).to_le_bytes());
+                comments.extend_from_slice(field);
+            }
+            blocks.push((4u8, comments));
+        }
+        blocks.extend(extra.iter().map(|(kind, body)| (*kind, body.to_vec())));
+        let mut out = b"fLaC".to_vec();
+        for (index, (kind, body)) in blocks.iter().enumerate() {
+            let last = if index + 1 == blocks.len() { 0x80 } else { 0 };
+            out.push(last | *kind);
+            out.extend_from_slice(&[
+                ((body.len() >> 16) & 0xff) as u8,
+                ((body.len() >> 8) & 0xff) as u8,
+                (body.len() & 0xff) as u8,
+            ]);
+            out.extend_from_slice(body);
+        }
+        out.extend_from_slice(frames);
+        out
+    }
+
+    #[cfg(feature = "hdr")]
+    fn add_iso_gain_map_segment(bytes: &mut Vec<u8>, metadata: &[u8]) {
+        let doc = parse_jpeg(bytes);
+        let range = doc.pictures[0];
+        let mpf = doc
+            .tree
+            .nodes()
+            .iter()
+            .find(|node| node.label == "APP2 · MPF")
+            .unwrap()
+            .range;
+        let mut segment = vec![0xFF, 0xE2];
+        let payload_len = ISO_GAIN_MAP_ID.len() + metadata.len();
+        segment.extend_from_slice(&((payload_len + 2) as u16).to_be_bytes());
+        segment.extend_from_slice(ISO_GAIN_MAP_ID);
+        segment.extend_from_slice(metadata);
+
+        let old_size = (range.len as u32).to_be_bytes();
+        let mpf_bytes = &bytes[mpf.start as usize..mpf.end() as usize];
+        let matches: Vec<_> = mpf_bytes
+            .windows(old_size.len())
+            .enumerate()
+            .filter_map(|(at, window)| (window == old_size).then_some(at))
+            .collect();
+        assert_eq!(matches.len(), 1, "fixture has one MPF size entry");
+        let size_at = mpf.start as usize + matches[0];
+        let new_size = range.len as u32 + segment.len() as u32;
+        bytes[size_at..size_at + 4].copy_from_slice(&new_size.to_be_bytes());
+        bytes.splice(range.start as usize + 2..range.start as usize + 2, segment);
+    }
+
+    #[cfg(feature = "hdr")]
+    #[test]
+    fn iso_gain_map_metadata_requires_a_complete_known_layout() {
+        assert!(valid_iso_gain_map_metadata(&[0, 0, 0, 0], false));
+        assert!(!valid_iso_gain_map_metadata(&[0, 0, 0, 0, 0], false));
+        assert!(!valid_iso_gain_map_metadata(&[0, 0, 0, 1], false));
+
+        let mut single_channel = vec![0; 61];
+        for denominator in [9, 17, 25, 33, 41, 49, 57] {
+            single_channel[denominator] = 1;
+        }
+        assert!(valid_iso_gain_map_metadata(&single_channel, true));
+        assert!(!valid_iso_gain_map_metadata(&single_channel[..60], true));
+        single_channel.push(0);
+        assert!(!valid_iso_gain_map_metadata(&single_channel, true));
+
+        let mut multi_channel = vec![0; 141];
+        multi_channel[4] = 1; // Three channel pairs.
+        for channel in 0..3 {
+            let start = 21 + channel * 40;
+            for denominator in [start + 4, start + 12, start + 20, start + 28, start + 36] {
+                multi_channel[denominator] = 1;
+            }
+        }
+        multi_channel[9] = 1;
+        multi_channel[17] = 1;
+        assert!(valid_iso_gain_map_metadata(&multi_channel, true));
+
+        let mut common_denominator = vec![0; 37];
+        common_denominator[4] = 0x08;
+        common_denominator[8] = 1;
+        assert!(valid_iso_gain_map_metadata(&common_denominator, true));
+        common_denominator[8] = 0;
+        assert!(!valid_iso_gain_map_metadata(&common_denominator, true));
+
+        let mut unknown_direction = vec![0; 61];
+        unknown_direction[4] = 0x04;
+        assert!(!valid_iso_gain_map_metadata(&unknown_direction, true));
+        let mut reserved_flag = vec![0; 61];
+        reserved_flag[4] = 0x80;
+        assert!(!valid_iso_gain_map_metadata(&reserved_flag, true));
+    }
+
+    #[cfg(feature = "audio")]
+    fn mp3_title_tag(title: &[u8]) -> Vec<u8> {
+        let mut body = b"TIT2".to_vec();
+        body.extend_from_slice(&((title.len() + 1) as u32).to_be_bytes());
+        body.extend_from_slice(&[0, 0, 0]);
+        body.extend_from_slice(title);
+        let mut tag = b"ID3\x03\0\0".to_vec();
+        let size = body.len();
+        tag.extend_from_slice(&[
+            ((size >> 21) & 0x7f) as u8,
+            ((size >> 14) & 0x7f) as u8,
+            ((size >> 7) & 0x7f) as u8,
+            (size & 0x7f) as u8,
+        ]);
+        tag.extend_from_slice(&body);
+        tag
+    }
+
+    #[cfg(feature = "audio")]
+    fn ape_text_item(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut item = Vec::new();
+        item.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        item.extend_from_slice(&0u32.to_le_bytes());
+        item.extend_from_slice(key);
+        item.push(0);
+        item.extend_from_slice(value);
+        item
+    }
+
+    #[cfg(feature = "audio")]
+    fn ape_footer(size: usize, count: u32) -> Vec<u8> {
+        let mut footer = vec![0; 32];
+        footer[..8].copy_from_slice(b"APETAGEX");
+        footer[8..12].copy_from_slice(&2000u32.to_le_bytes());
+        footer[12..16].copy_from_slice(&(size as u32).to_le_bytes());
+        footer[16..20].copy_from_slice(&count.to_le_bytes());
+        footer
+    }
+
+    #[cfg(feature = "audio")]
+    fn ape_header(size: usize, count: u32) -> Vec<u8> {
+        let mut header = ape_footer(size, count);
+        header[20..24].copy_from_slice(&0xa000_0000u32.to_le_bytes());
+        header
+    }
+
+    #[cfg(feature = "audio")]
+    fn id3v1(title: &[u8]) -> Vec<u8> {
+        let mut tag = vec![0; 128];
+        tag[..3].copy_from_slice(b"TAG");
+        let len = title.len().min(30);
+        tag[3..3 + len].copy_from_slice(&title[..len]);
+        tag
     }
 
     fn revealing(orientation: u16) -> Vec<u8> {
@@ -1115,6 +1814,116 @@ mod tests {
         jpeg
     }
 
+    #[cfg(feature = "audio")]
+    #[test]
+    fn mp3_copy_removes_id3v2_and_confirms_its_title_without_changing_audio() {
+        let audio = [0xff, 0xfb, 0x90, 0x64, 1, 2, 3, 4];
+        let mut original = mp3_title_tag(b"Sample song");
+        original.extend_from_slice(&audio);
+
+        let cleaned = clean(&original).unwrap();
+        assert_eq!(cleaned.bytes, audio);
+        assert_eq!(cleaned.removed[0].what, "ID3v2 metadata tags");
+
+        let before = crate::verification::snapshot(&crate::summary::summarize(&original));
+        let after = crate::verification::snapshot(&crate::summary::summarize(&cleaned.bytes));
+        let report = crate::verification::compare(&before, &after);
+        assert!(report.removed.iter().any(|item| item.kind == "title"));
+        assert!(report.unchecked.is_empty());
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn mp3_copy_removes_ape_id3v1_plus_and_id3v1_but_keeps_partial_findings_unconfirmed() {
+        let audio = [0xff, 0xfb, 0x90, 0x64, 1, 2, 3, 4];
+        let item = ape_text_item(b"Artist", b"Alice");
+        let mut original = audio.to_vec();
+        original.extend_from_slice(&item);
+        original.extend_from_slice(&ape_footer(item.len() + 32, 1));
+        let mut plus = vec![0; 227];
+        plus[..4].copy_from_slice(b"TAG+");
+        original.extend_from_slice(&plus);
+        original.extend_from_slice(&id3v1(b"Old title"));
+
+        let cleaned = clean(&original).unwrap();
+        assert_eq!(cleaned.bytes, audio);
+        assert!(
+            cleaned
+                .removed
+                .iter()
+                .any(|item| item.what == "APE metadata tags")
+        );
+        assert!(
+            cleaned
+                .removed
+                .iter()
+                .any(|item| item.what == "ID3v1 Plus extension")
+        );
+        assert!(
+            cleaned
+                .removed
+                .iter()
+                .any(|item| item.what == "ID3v1 metadata tag")
+        );
+
+        let before = crate::verification::snapshot(&crate::summary::summarize(&original));
+        let after = crate::verification::snapshot(&crate::summary::summarize(&cleaned.bytes));
+        let report = crate::verification::compare(&before, &after);
+        assert!(report.removed.is_empty());
+        assert!(report.unchecked.iter().any(|item| item.kind == "artist"));
+        assert!(report.unchecked.iter().any(|item| item.kind == "title"));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn mp3_copy_refuses_an_ape_footer_with_inconsistent_items() {
+        let mut original = vec![0xff, 0xfb, 0x90, 0x64, 1, 2, 3, 4];
+        original.extend_from_slice(&ape_footer(32, 1));
+        assert_eq!(clean(&original), Err(CleanError::Damaged));
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn mp3_copy_removes_a_consistent_ape_header_and_footer() {
+        let audio = [0xff, 0xfb, 0x90, 0x64, 1, 2, 3, 4];
+        let item = ape_text_item(b"Artist", b"Alice");
+        let mut original = audio.to_vec();
+        original.extend_from_slice(&ape_header(item.len() + 32, 1));
+        original.extend_from_slice(&item);
+        original.extend_from_slice(&{
+            let mut footer = ape_footer(item.len() + 32, 1);
+            footer[20..24].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+            footer
+        });
+
+        let cleaned = clean(&original).unwrap();
+        assert_eq!(cleaned.bytes, audio);
+        assert!(
+            cleaned
+                .removed
+                .iter()
+                .any(|item| item.what == "APE metadata tags")
+        );
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn mp3_copy_refuses_stacked_id3v2_until_both_tags_are_inspected() {
+        let mut original = mp3_title_tag(b"First title");
+        original.extend_from_slice(&mp3_title_tag(b"Second title"));
+        original.extend_from_slice(&[0xff, 0xfb, 0x90, 0x64, 1, 2, 3, 4]);
+
+        assert_eq!(clean(&original), Err(CleanError::Damaged));
+        let doc = crate::audio::parse_mp3(&original);
+        assert!(!doc.metadata_complete);
+        assert!(
+            doc.tree
+                .nodes()
+                .iter()
+                .any(|node| { node.label == "stacked ID3v2 tag is not inspected" })
+        );
+    }
+
     #[test]
     fn a_photo_loses_what_it_reveals_and_keeps_its_picture() {
         let original = revealing(1);
@@ -1134,6 +1943,262 @@ mod tests {
             what.contains(&"data after the end of the picture"),
             "{what:?}"
         );
+    }
+
+    #[cfg(feature = "hdr")]
+    #[test]
+    fn an_hdr_photo_keeps_its_gain_map_and_cleans_primary_metadata() {
+        let original = include_bytes!("../tests/fixtures/iphone-hdr.jpg");
+        let before_doc = parse_jpeg(original);
+        assert_eq!(before_doc.pictures.len(), 1);
+        assert!(before_doc.facts.camera.is_some());
+        assert!(before_doc.facts.owner.is_some());
+        let map_before = before_doc.pictures[0];
+
+        let cleaned = clean(original).unwrap();
+        assert_eq!(
+            cleaned.bytes.len(),
+            original.len(),
+            "MPF offsets stay fixed"
+        );
+        assert_eq!(
+            scan(&cleaned.bytes),
+            scan(original),
+            "primary pixels stay fixed"
+        );
+        let after_doc = parse_jpeg(&cleaned.bytes);
+        assert_eq!(after_doc.pictures, [map_before]);
+        assert_eq!(
+            scan(&cleaned.bytes[map_before.start as usize..map_before.end() as usize]),
+            scan(&original[map_before.start as usize..map_before.end() as usize]),
+            "gain-map pixels stay fixed"
+        );
+        assert_eq!(after_doc.facts.camera, None);
+        assert_eq!(after_doc.facts.owner, None);
+        assert_eq!(after_doc.facts.serial, None);
+        assert_eq!(after_doc.facts.location, None);
+        assert!(after_doc.metadata_complete);
+
+        let picture = after_doc
+            .tree
+            .nodes()
+            .iter()
+            .find(|node| node.label == crate::jpeg::LISTED_PICTURE)
+            .unwrap();
+        assert_eq!(
+            picture.value,
+            Some(crate::model::Value::Text("HDR gain map".into()))
+        );
+        let map = &cleaned.bytes[map_before.start as usize..map_before.end() as usize];
+        assert!(
+            map.windows(b"HDRGainMapVersion".len())
+                .any(|w| w == b"HDRGainMapVersion")
+        );
+        assert!(
+            cleaned
+                .removed
+                .iter()
+                .any(|item| item.what.starts_with("EXIF"))
+        );
+
+        let before = crate::verification::snapshot(&crate::summary::summarize(original));
+        let after = crate::verification::snapshot(&crate::summary::summarize(&cleaned.bytes));
+        let report = crate::verification::compare(&before, &after);
+        assert!(report.removed.iter().any(|item| item.kind == "camera"));
+        assert!(report.removed.iter().any(|item| item.kind == "owner"));
+        assert!(report.removed.iter().any(|item| item.kind == "location"));
+        assert!(report.unchecked.is_empty());
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn flac_clean_copy_removes_comments_updates_last_flag_and_keeps_audio_bytes() {
+        let frames = [0xff, 0xf8, 0x69, 0x08, 1, 2, 3, 4];
+        let original = flac_with_metadata(
+            Some(&[b"TITLE=Song", b"LOCATION=Kyiv"]),
+            &[(1, &[0, 0, 0])],
+            &frames,
+        );
+        let before = crate::summary::summarize(&original);
+        assert_eq!(before.format, "flac");
+        assert!(before.complete);
+
+        let cleaned = clean(&original).unwrap();
+        assert!(cleaned.bytes.len() < original.len());
+        assert!(
+            cleaned.bytes.ends_with(&frames),
+            "FLAC frames stay byte for byte"
+        );
+        assert_eq!(cleaned.removed[0].what, "FLAC Vorbis comments");
+
+        let after = crate::audio::parse(&cleaned.bytes).unwrap();
+        assert!(after.metadata_complete);
+        assert!(after.facts.is_empty());
+        let root = after.tree.root().unwrap();
+        let padding = after
+            .tree
+            .get(root)
+            .children
+            .iter()
+            .map(|&id| after.tree.get(id))
+            .find(|node| node.label == "FLAC padding block")
+            .unwrap();
+        assert_ne!(cleaned.bytes[padding.range.start as usize] & 0x80, 0);
+
+        let read_back = crate::summary::summarize(&cleaned.bytes);
+        let report = crate::verification::compare(
+            &crate::verification::snapshot(&before),
+            &crate::verification::snapshot(&read_back),
+        );
+        assert!(report.removed.iter().any(|item| item.kind == "title"));
+        assert!(report.removed.iter().any(|item| item.kind == "location"));
+        assert!(report.unchecked.is_empty());
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn flac_clean_copy_refuses_uninspected_blocks_and_missing_audio_frames() {
+        let frames = [0xff, 0xf8, 0x69, 0x08, 1, 2, 3, 4];
+        let unknown = flac_with_metadata(Some(&[b"TITLE=Song"]), &[(2, &[1, 2, 3])], &frames);
+        assert_eq!(clean(&unknown), Err(CleanError::Unsupported));
+
+        let no_frames = flac_with_metadata(Some(&[b"TITLE=Song"]), &[], &[]);
+        assert_eq!(clean(&no_frames), Err(CleanError::Damaged));
+
+        let empty_comment = flac_with_metadata(Some(&[]), &[(1, &[0, 0, 0])], &frames);
+        let parsed = crate::audio::parse(&empty_comment).unwrap();
+        assert!(parsed.metadata_complete);
+        // Even an empty comment block is an explicitly removable tag block.
+        assert!(clean(&empty_comment).is_ok());
+    }
+
+    #[cfg(feature = "audio")]
+    #[test]
+    fn flac_clean_copy_removes_cover_art_whole_and_supports_art_only_files() {
+        let frames = [0xff, 0xf8, 0x69, 0x08, 1, 2, 3, 4];
+        let picture_data = [0, 0, 0, 3, b'P', b'N', b'G', 0, 0, 0, 0, 1, 2, 3];
+        let with_art = flac_with_metadata(Some(&[b"TITLE=Song"]), &[(6, &picture_data)], &frames);
+        let before = crate::summary::summarize(&with_art);
+        assert!(before.complete);
+
+        let cleaned = clean(&with_art).unwrap();
+        assert!(cleaned.bytes.ends_with(&frames));
+        assert!(
+            cleaned
+                .removed
+                .iter()
+                .any(|item| item.what == "FLAC Vorbis comments")
+        );
+        assert!(
+            cleaned
+                .removed
+                .iter()
+                .any(|item| item.what == "FLAC pictures")
+        );
+        let after = crate::audio::parse(&cleaned.bytes).unwrap();
+        assert!(after.metadata_complete);
+        assert!(after.facts.is_empty());
+        assert!(
+            after
+                .tree
+                .nodes()
+                .iter()
+                .all(|node| node.label != "FLAC picture block")
+        );
+
+        let art_only = flac_with_metadata(None, &[(6, &picture_data)], &frames);
+        assert!(crate::summary::summarize(&art_only).complete);
+        let art_only_cleaned = clean(&art_only).unwrap();
+        assert_eq!(art_only_cleaned.removed.len(), 1);
+        assert_eq!(art_only_cleaned.removed[0].what, "FLAC pictures");
+        assert!(art_only_cleaned.bytes.ends_with(&frames));
+    }
+
+    #[cfg(feature = "hdr")]
+    #[test]
+    fn an_hdr_copy_refuses_unknown_gain_map_xmp_without_iso_fallback() {
+        let mut bytes = include_bytes!("../tests/fixtures/iphone-hdr.jpg").to_vec();
+        let field = b"HDRGainMapVersion";
+        let replacement = b"PrivateMapField!!";
+        assert_eq!(field.len(), replacement.len());
+        let at = bytes
+            .windows(field.len())
+            .position(|window| window == field)
+            .unwrap();
+        bytes[at..at + field.len()].copy_from_slice(replacement);
+        assert_eq!(clean(&bytes), Err(CleanError::Unsupported));
+    }
+
+    #[test]
+    fn a_photo_with_an_unrecognized_secondary_picture_is_not_blanked() {
+        let mut bytes = include_bytes!("../tests/fixtures/iphone-hdr.jpg").to_vec();
+        let old = b"HDRGainMap";
+        let new = b"UnknownMap";
+        assert_eq!(old.len(), new.len());
+        let mut at = 0;
+        while let Some(relative) = bytes[at..]
+            .windows(old.len())
+            .position(|window| window == old)
+        {
+            let start = at + relative;
+            bytes[start..start + old.len()].copy_from_slice(new);
+            at = start + new.len();
+        }
+
+        let doc = parse_jpeg(&bytes);
+        assert_eq!(doc.pictures.len(), 1);
+        assert_eq!(
+            doc.tree
+                .nodes()
+                .iter()
+                .find(|node| node.label == crate::jpeg::LISTED_PICTURE)
+                .and_then(|node| node.value.as_ref()),
+            Some(&crate::model::Value::Text("picture".into()))
+        );
+        assert_eq!(clean(&bytes), Err(CleanError::Unsupported));
+    }
+
+    #[cfg(feature = "hdr")]
+    #[test]
+    fn a_valid_iso_gain_map_allows_unknown_map_xmp_to_be_removed() {
+        let mut bytes = include_bytes!("../tests/fixtures/iphone-hdr.jpg").to_vec();
+        let field = b"HDRGainMapVersion";
+        let replacement = b"PrivateMapField!!";
+        assert_eq!(field.len(), replacement.len());
+        let at = bytes
+            .windows(field.len())
+            .position(|window| window == field)
+            .unwrap();
+        bytes[at..at + field.len()].copy_from_slice(replacement);
+
+        let mut metadata = vec![0; 61];
+        for denominator in [9, 17, 25, 33, 41, 49, 57] {
+            metadata[denominator] = 1;
+        }
+        add_iso_gain_map_segment(&mut bytes, &metadata);
+        let before = crate::summary::summarize(&bytes);
+        assert!(before.complete);
+
+        let cleaned = clean(&bytes).unwrap();
+        let map = parse_jpeg(&cleaned.bytes).pictures[0];
+        let map_bytes = &cleaned.bytes[map.start as usize..map.end() as usize];
+        assert!(
+            map_bytes
+                .windows(ISO_GAIN_MAP_ID.len())
+                .any(|w| w == ISO_GAIN_MAP_ID)
+        );
+        assert!(
+            !map_bytes
+                .windows(replacement.len())
+                .any(|w| w == replacement)
+        );
+        assert!(
+            cleaned
+                .removed
+                .iter()
+                .any(|item| item.what.starts_with("XMP:"))
+        );
+        assert!(crate::summary::summarize(&cleaned.bytes).complete);
     }
 
     #[test]

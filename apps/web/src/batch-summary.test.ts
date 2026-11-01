@@ -5,7 +5,7 @@ import { summarizeBatch } from "./batch";
 function item(
   name: string,
   state: BatchItem["state"],
-  options: Partial<Pick<BatchItem, "lines" | "reveals" | "headline" | "skip" | "format">> = {},
+  options: Partial<Pick<BatchItem, "lines" | "reveals" | "headline" | "skip" | "format" | "hasRemovableMetadata">> = {},
 ): BatchItem {
   return {
     file: new File([name], name),
@@ -72,12 +72,45 @@ describe("batch summary", () => {
     });
   });
 
-  it("does not offer copies of read-only formats even when they reveal information", () => {
-    const files = ["mp3", "flac", "ogg", "eml", "msg", "unknown"].map((format) =>
-      item(`file.${format}`, "done", { format, reveals: ["author"] }),
-    );
+  it("offers clean copies for supported MP3 and FLAC tags but not other read-only formats", () => {
+    const files = ["mp3", "flac", "ogg", "eml", "msg", "unknown"].map((format) => item(
+      `file.${format}`,
+      "done",
+      { format, reveals: ["author"], ...(["mp3", "flac"].includes(format) ? { hasRemovableMetadata: true } : {}) },
+    ));
     const result = summarizeBatch(files, "reveals");
-    expect(result).toMatchObject({ revealing: 6, chosen: 0, anyPick: false });
+    expect(result).toMatchObject({ revealing: 6, chosen: 2, anyPick: true });
+  });
+
+  it("offers a tagged MP3 copy when every frame is outside the supported fact list", () => {
+    const tagged = item("tagged.mp3", "done", {
+      format: "mp3",
+      lines: [{ kind: "warning", text: "Partial inspection", node: 0 }],
+      hasRemovableMetadata: true,
+    });
+    const plain = item("plain.mp3", "done", { format: "mp3" });
+
+    expect(summarizeBatch([tagged, plain], "all")).toMatchObject({ chosen: 1, anyPick: true });
+  });
+
+  it("does not offer an MP3 copy when the edge tag or audio frame did not pass the clean checks", () => {
+    const unsafe = item("stacked.mp3", "done", {
+      format: "mp3",
+      reveals: ["artist"],
+      hasRemovableMetadata: false,
+    });
+
+    expect(summarizeBatch([unsafe], "reveals")).toMatchObject({ chosen: 0, anyPick: false });
+  });
+
+  it("does not offer a FLAC copy when the parser found an uninspected metadata block", () => {
+    const partial = item("partial.flac", "done", {
+      format: "flac",
+      reveals: ["title"],
+      hasRemovableMetadata: false,
+    });
+
+    expect(summarizeBatch([partial], "reveals")).toMatchObject({ chosen: 0, anyPick: false });
   });
 
   it("keeps only the visible page of row descriptors while counting every match", () => {
