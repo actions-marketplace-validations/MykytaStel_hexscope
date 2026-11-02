@@ -60,6 +60,7 @@ export interface BatchSummary {
   flagged: number;
   dangerous: boolean;
   chosen: number;
+  cleanable: number;
   problemCount: number;
   shownCount: number;
   shown: { item: BatchItem; index: number }[];
@@ -123,6 +124,7 @@ export function summarizeBatch(items: BatchItem[], show: BatchShow, visibleLimit
     flagged: 0,
     dangerous: false,
     chosen: 0,
+    cleanable: 0,
     problemCount: 0,
     shownCount: 0,
     shown: [],
@@ -142,7 +144,10 @@ export function summarizeBatch(items: BatchItem[], show: BatchShow, visibleLimit
       if (facts.dangerous) summary.dangerous = true;
     }
     if (facts.problem) summary.problemCount++;
-    if (facts.canClean && !item.skip) summary.chosen++;
+    if (facts.canClean) {
+      summary.cleanable++;
+      if (!item.skip) summary.chosen++;
+    }
 
     const matches = show === "all" || (show === "reveals" ? facts.reveals : facts.problem);
     if (matches) {
@@ -258,6 +263,10 @@ export class BatchView {
     clearTimeout(this.pending);
     this.pending = 0;
     this.lastDrawn = performance.now();
+    const active = document.activeElement;
+    const focusedControl = active instanceof HTMLElement && this.host.contains(active)
+      ? active.dataset.batchFocus
+      : undefined;
     const items = this.items;
     const totals = summarizeBatch(items, this.show, this.limit);
 
@@ -328,6 +337,7 @@ export class BatchView {
     if (totals.busy) {
       const toggle = el("button", "btn batch-toggle", translateText(this.paused ? "Resume reading" : "Pause reading", currentLocale()));
       toggle.type = "button";
+      toggle.dataset.batchFocus = "reading-toggle";
       toggle.setAttribute("aria-pressed", String(this.paused));
       toggle.addEventListener("click", () => this.hooks.toggleReading());
       head.append(toggle);
@@ -363,6 +373,7 @@ export class BatchView {
     bar.setAttribute("aria-label", "Show");
     for (const [key, label, n] of filters) {
       const b = el("button", undefined, `${label} · ${n}`);
+      b.dataset.batchFocus = `filter:${key}`;
       b.setAttribute("aria-pressed", String(this.show === key));
       b.addEventListener("click", () => {
         this.show = key;
@@ -370,6 +381,36 @@ export class BatchView {
         this.draw();
       });
       bar.append(b);
+    }
+    const selection = el("div", "batch-selection");
+    selection.setAttribute("role", "group");
+    selection.setAttribute("aria-label", translateText("Clean-copy selection", currentLocale()));
+    if (!totals.busy && totals.cleanable > 1) {
+      const allSelected = totals.chosen === totals.cleanable;
+      const bulk = el(
+        "button",
+        "batch-select-all",
+        translateText(
+          allSelected ? "Clear clean-copy selection" : `Select all ${plural(totals.cleanable, "cleanable file", "cleanable files")}`,
+          currentLocale(),
+        ),
+      );
+      bulk.type = "button";
+      bulk.dataset.batchFocus = "bulk-selection";
+      bulk.title = translateText(
+        allSelected
+          ? "Remove every cleanable file in this batch from the copy selection"
+          : "Select every cleanable file in this batch, including files hidden by the current filter",
+        currentLocale(),
+      );
+      bulk.addEventListener("click", () => {
+        const selectAll = !allSelected;
+        for (const item of this.items) {
+          if (cleanable(item)) item.skip = !selectAll;
+        }
+        this.draw();
+      });
+      selection.append(bulk);
     }
     const list = el("ul", "batch-list");
     // With any tick in the list, every row keeps its place for one.
@@ -394,6 +435,7 @@ export class BatchView {
       if (cleanable(item)) {
         const pick = el("input", "batch-pick");
         pick.type = "checkbox";
+        pick.dataset.batchFocus = `pick:${index}`;
         pick.checked = !item.skip;
         pick.setAttribute("aria-label", `Make a clean copy of ${item.file.name}`);
         pick.title = "Make a clean copy of this one";
@@ -410,7 +452,9 @@ export class BatchView {
       li.append(row);
       list.append(li);
     }
-    card.append(head, bar, list);
+    card.append(head, bar);
+    if (selection.childNodes.length) card.append(selection);
+    card.append(list);
     if (totals.shownCount > this.limit) {
       const more = el("button", "btn", `Show ${Math.min(PAGE, totals.shownCount - this.limit)} more of ${totals.shownCount - this.limit}`);
       more.addEventListener("click", () => {
@@ -420,5 +464,10 @@ export class BatchView {
       card.append(more);
     }
     this.host.replaceChildren(card);
+    if (focusedControl) {
+      const target = Array.from(this.host.querySelectorAll<HTMLElement>("[data-batch-focus]"))
+        .find((control) => control.dataset.batchFocus === focusedControl);
+      target?.focus({ preventScroll: true });
+    }
   }
 }

@@ -23,7 +23,8 @@ how a version is made is in [releasing.md](releasing.md).
 | 0.7.2 | `cargo install` with Rust 1.88 and later | shipped 2026-10-19 |
 | 0.8.0 | Archive Trace, safer sharing, evidence-bound email claims, bounded large-file analysis, and read-only MP3/FLAC/Ogg tags | shipped 2026-10-25 |
 | 0.9.0 | A lighter page until a file is chosen, large files on phones, sharing from the film lab, browsing large archives | GitHub Release published 2026-10-30; Homebrew tap updated 2026-11-01 |
-| 0.9.1 and later 0.9.x | Substantial collections of features, reliability fixes and usability improvements | collect merged post-tag work; ship each collection when ready |
+| 0.10.0 | Chained Ogg metadata, safer audio clean copies, Ultra HDR clean copies, batch usability and core reliability | shipped 2026-11-02 |
+| 0.11.0 and later | Substantial collections of features, reliability fixes and usability improvements | collect merged post-tag work; ship each collection when ready |
 | 1.0.0 | Stable | when its criteria hold, not before 2026-11-30 |
 
 ### 0.9.0 — shipped 2026-10-30
@@ -38,11 +39,24 @@ the site, crates and `v0.9.0` tag were published together. The Homebrew formula
 now points at `0.9.0`; upgrading from `0.8.0` verified the archive checksum and
 the formula's installed-version test passed.
 
-The large-file and archive workflows still need physical iOS Safari and
-Android Chrome checks, including time and memory behavior, the Film Lab share
-sheet, and screen-reader navigation. Code merged after the `v0.9.0` tag,
-including HDR clean copies, belongs to the next `0.9.x` collection; keep the
-published tag immutable.
+The physical iOS Safari and Android Chrome checks recorded for this release
+remain open, including large-file time and memory behavior, the Film Lab share
+sheet, and screen-reader navigation. The HDR and audio work merged after this
+tag shipped in `0.10.0`; published tags remain immutable.
+
+### 0.10.0 — shipped 2026-11-02
+
+The work merged after `v0.9.0` shipped together: the core reads chained
+Vorbis and Opus metadata and checks Ogg page order and checksums; MP3 and FLAC
+clean copies remove supported metadata and are read back for verification;
+Ultra HDR copies preserve the bounded gain map while removing personal photo
+metadata; batch selection is easier to operate by keyboard and across filters;
+and the video parser safely handles malformed dates. The site, five-platform
+CLI release, four crates and Homebrew formula are published as `0.10.0`.
+
+Physical iPhone Safari checks remain open for the Film Lab share sheet and
+large-file time and memory behavior. Browser emulation and synthetic fixtures
+do not establish those device behaviors.
 
 ### 0.3.0 — shipped 2026-10-12
 
@@ -164,7 +178,7 @@ listed on GitHub Marketplace. What was planned as 0.7.0 is now 0.8.0.
 - Research to publish: what messengers and social networks take out of a
   file sent through them, and what still ties a cleaned file to its author.
 
-### 0.9.1 — release parity, safer audio copies and browser reliability (in progress)
+### 0.10.0 — safer media metadata, release parity and browser reliability (in progress)
 
 The Rust core now reads metadata in a bounded MPF gain map, includes its
 findings in the photo's evidence, and makes a fixed-length clean copy that
@@ -177,11 +191,20 @@ browser flow cover the HDR code path. CI also runs a focused analyzer and
 keyboard smoke in Firefox and WebKit, alongside the full Desktop Chrome and
 Pixel 7 Chromium suites. FLAC clean copies remove Vorbis comments and entire
 embedded picture blocks while retaining other supported metadata and audio
-frame bytes; unknown or incomplete metadata keeps the file read-only. Ogg
-remains read-only, and checksums are validated on pages read for metadata;
-later audio pages are not decoded or verified. Before calling HDR
-device-verified, open and compare the clean copy on a physical iPhone. No
-version change or release is part of this in-progress work.
+frame bytes; unknown or incomplete metadata keeps the file read-only. MP3
+clean copies remove up to 16 consecutive leading ID3v2 tags and
+preserve the compressed audio frames byte for byte. Ogg remains read-only.
+Vorbis and Opus tags are collected across sequential chained streams. Ogg page
+sequence and checksums are validated through the end of supported streams,
+while interleaved streams remain incomplete and audio packets are not decoded.
+Before calling HDR device-verified, open and compare the clean copy on a
+physical iPhone.
+
+Batch results now include a one-step control to select or clear every file
+that can make a clean copy, even when a filter hides some eligible files.
+The bulk selection control is available in English and Ukrainian. Batch
+filters, bulk selection, and individual copy checkboxes retain keyboard focus
+when the list redraws.
 
 ### 1.0.0 — Stable (when these hold)
 
