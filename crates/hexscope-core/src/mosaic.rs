@@ -2,12 +2,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug)]
 pub struct Signal {
+    /// One-based position in the caller's input list.
     pub index: usize,
+    /// Stored serial text; comparisons trim surrounding whitespace and ignore empty or common placeholders.
     pub serial: Option<String>,
+    /// Decimal latitude and longitude. Invalid or out-of-range coordinates are ignored.
     pub location: Option<[f64; 2]>,
+    /// Full EXIF or ISO timestamp. Unknown-zone wall clocks remain separate from UTC.
     pub taken: Option<String>,
 }
 #[derive(Debug)]
+/// Cross-file relationships, expressed only as indexes and counts.
 pub struct Report {
     pub total: usize,
     pub serial_groups: Vec<Vec<usize>>,
@@ -16,7 +21,37 @@ pub struct Report {
     pub local_date_order: Vec<usize>,
     pub utc_date_order: Vec<usize>,
 }
+
+/// The evidence type that connects more than one photo in a mosaic group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelationshipKind {
+    RepeatedSerial,
+    NearbyLocation,
+    LocalDateOrder,
+    UtcDateOrder,
+}
+
+impl RelationshipKind {
+    /// Stable English label for human-readable CLI output.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RepeatedSerial => "repeated stored serial values",
+            Self::NearbyLocation => "GPS points within 100m of the first file",
+            Self::LocalDateOrder => "dates without a time zone",
+            Self::UtcDateOrder => "dates normalized to UTC",
+        }
+    }
+}
+
+/// A typed view of one relationship; indexes are one-based input positions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelationshipGroup<'a> {
+    pub kind: RelationshipKind,
+    pub indexes: &'a [usize],
+}
+
 impl Report {
+    /// Stable, value-free `hexscope.photo-mosaic` version 1 JSON.
     pub fn to_json(&self) -> String {
         format!(
             "{{\"schema\":\"hexscope.photo-mosaic\",\"version\":1,\"total\":{},\"serial_groups\":{:?},\"location_groups\":{:?},\"located_files\":{},\"local_date_order\":{:?},\"utc_date_order\":{:?},\"location_radius_metres\":100,\"inferences\":false}}",
@@ -27,6 +62,65 @@ impl Report {
             self.local_date_order,
             self.utc_date_order
         )
+    }
+
+    /// Groups in stable evidence order: serial, location, local dates, UTC dates.
+    /// The report's JSON v1 remains the separately versioned export contract.
+    pub fn relationship_groups(&self) -> Vec<RelationshipGroup<'_>> {
+        let mut groups =
+            Vec::with_capacity(self.serial_groups.len() + self.location_groups.len() + 2);
+        groups.extend(self.serial_groups.iter().map(|indexes| RelationshipGroup {
+            kind: RelationshipKind::RepeatedSerial,
+            indexes,
+        }));
+        groups.extend(
+            self.location_groups
+                .iter()
+                .map(|indexes| RelationshipGroup {
+                    kind: RelationshipKind::NearbyLocation,
+                    indexes,
+                }),
+        );
+        if self.local_date_order.len() > 1 {
+            groups.push(RelationshipGroup {
+                kind: RelationshipKind::LocalDateOrder,
+                indexes: &self.local_date_order,
+            });
+        }
+        if self.utc_date_order.len() > 1 {
+            groups.push(RelationshipGroup {
+                kind: RelationshipKind::UtcDateOrder,
+                indexes: &self.utc_date_order,
+            });
+        }
+        groups
+    }
+
+    /// Number of groups that connect more than one input photo.
+    pub fn relationship_group_count(&self) -> usize {
+        self.serial_groups.len()
+            + self.location_groups.len()
+            + usize::from(self.local_date_order.len() > 1)
+            + usize::from(self.utc_date_order.len() > 1)
+    }
+
+    /// Number of distinct input photos present in any relationship group.
+    pub fn related_file_count(&self) -> usize {
+        self.related_file_indexes().len()
+    }
+
+    /// Sorted, unique one-based indexes that occur in any relationship group.
+    pub fn related_file_indexes(&self) -> Vec<usize> {
+        let mut indexes = BTreeSet::new();
+        indexes.extend(self.serial_groups.iter().flatten().copied());
+        indexes.extend(self.location_groups.iter().flatten().copied());
+        if self.local_date_order.len() > 1 {
+            indexes.extend(self.local_date_order.iter().copied());
+        }
+        if self.utc_date_order.len() > 1 {
+            indexes.extend(self.utc_date_order.iter().copied());
+        }
+        indexes.into_iter().collect()
     }
 }
 fn sphere([lat, lon]: [f64; 2]) -> Option<[f64; 3]> {
@@ -134,6 +228,13 @@ fn date(text: &str) -> Option<(i64, bool)> {
     };
     Some((timestamp, known))
 }
+/// Groups repeated serials after trimming surrounding whitespace, representative
+/// GPS clusters within 100 m, and valid dates ordered separately by known and
+/// unknown time zone.
+///
+/// Indexes must be positive and unique. Invalid serial placeholders,
+/// coordinates, and timestamps are ignored. More than 1,000 signals is an
+/// error; no raw metadata values are copied into the report.
 pub fn analyze(signals: &[Signal]) -> Result<Report, &'static str> {
     if signals.len() > 1000 {
         return Err("photo mosaic is limited to 1000 files");
