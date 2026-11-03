@@ -33,7 +33,7 @@ jobs:
       # Installs exactly the toolchain, components and targets that
       # rust-toolchain.toml pins, so CI and local builds cannot drift.
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -63,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Passes on what gives nothing away
         uses: ./
         with:
@@ -97,7 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: rustup toolchain install nightly --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: crates/hexscope-core/fuzz
       - name: Install cargo-fuzz
@@ -108,6 +108,9 @@ jobs:
           cp -R tests/corpus/. fuzz/corpus/parse/
           cp -R fuzz/seeds/parse_audio/. fuzz/corpus/parse/
           cp -R fuzz/seeds/parse_audio/. fuzz/corpus/parse_audio/
+          mkdir -p fuzz/corpus/clean_roundtrip
+          cp -R tests/corpus/. fuzz/seeds/parse_audio/. fuzz/seeds/clean_roundtrip/. fuzz/corpus/clean_roundtrip/
+          cp tests/fixtures/iphone-hdr.jpg fuzz/corpus/clean_roundtrip/
         working-directory: crates/hexscope-core
       - name: Fuzz smoke run
         # Real-format seeds exercise the dispatcher and focused parser targets.
@@ -116,6 +119,7 @@ jobs:
           cargo +nightly fuzz run parse_audio -- -max_total_time=30
           cargo +nightly fuzz run parse_eml -- -max_total_time=30
           cargo +nightly fuzz run copies -- -max_total_time=30 -rss_limit_mb=4096
+          cargo +nightly fuzz run clean_roundtrip -- -max_total_time=45 -rss_limit_mb=4096
         working-directory: crates/hexscope-core
 
   # Builds the static site. The output runs on any static host; deploying is
@@ -129,7 +133,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install wasm-bindgen CLI (must match the pinned crate)
         run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
