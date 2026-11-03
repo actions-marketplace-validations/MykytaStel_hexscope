@@ -11,8 +11,8 @@ importers:
   apps/web:
     dependencies:
       lucide:
-        specifier: ^1.64.0
-        version: 1.64.0
+        specifier: ^1.65.0
+        version: 1.65.0
     devDependencies:
       '@axe-core/playwright':
         specifier: ^4.14.0
@@ -421,8 +421,8 @@ packages:
     resolution: {integrity: sha512-WkUDrojuJs0xkgGf2udWxa3yGBRxPtxUkB79i6aCZLRgc7PM8fZe9TosfPDcvEpQZbuFASnHYmRLBLUbmLOIIA==}
     engines: {node: '>= 12.0.0'}
 
-  lucide@1.64.0:
-    resolution: {integrity: sha512-2k481p+2dnI88E5chX8D1niwJzar/0EMFZwS93E/umHVxl+Po5uoDIGuo64Ij3a35YaD1J6EsWulDzKaod5wOw==}
+  lucide@1.65.0:
+    resolution: {integrity: sha512-mtWm+77jbrebaz5Nv7lqL0Oj41fuNPxtUOjm1UxHjCDiwKqE5uEYxcfyZcnZrz9KDcmYQbIWcovs/bn+s16kEw==}
 
   magic-string@1.4.3:
     resolution: {integrity: sha512-z12OxmaPGE0F4xlpGdjuAUckipLpQlTAuAmyGhNoD7ODpYUzvDfvtxUbjM/jwznyP178oju/KDdyi220wNJ0RQ==}
@@ -803,7 +803,7 @@ snapshots:
       lightningcss-win32-arm64-msvc: 1.33.0
       lightningcss-win32-x64-msvc: 1.33.0
 
-  lucide@1.64.0: {}
+  lucide@1.65.0: {}
 
   magic-string@1.4.3:
     dependencies:
