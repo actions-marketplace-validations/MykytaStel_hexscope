@@ -11,6 +11,51 @@ change what the CLI's JSON says. How a version is made: [docs/releasing.md](docs
 What is merged but not released yet is in [`changes/`](changes/), a file a
 change; `node scripts/changelog.mjs` shows it as it will read here.
 
+## [0.14.0] — 2026-11-08
+
+### Added
+
+- **See complete, partial and unsupported reads by format across a local
+  batch**, then focus the list on files that could not be fully checked.
+- **Use one shared read-status classifier in the core and WebAssembly**, so
+  the browser, CLI and core agree on unknown and incomplete inputs.
+- **Keep a clean-copy evidence scorecard in CI.** Complete fixtures and
+  focused core tests cover each advertised removal kind; the log prints only
+  per-format counts, never metadata values.
+
+### Changed
+
+- **Feedback starts with a file's structure report turned off**, so a person
+  must choose to attach it.
+- **The feedback form names the details saved with a message**, including its
+  language and that no file contents or IP address are stored with it.
+- **Only claim MP3 fields the ID3 reader can inspect.** User-defined ID3 text
+  remains incomplete, and Vorbis-only location and organization are no longer
+  in the MP3 clean-copy contract.
+
+### Fixed
+
+- **The incomplete-read batch filter is translated in Ukrainian**, including
+  its count.
+- **Clean-copy downloads retain their format type** when the worker returns
+  untyped bytes, helping mobile browsers recognize the saved file.
+
+## [0.13.0] — 2026-11-08
+
+### Added
+
+- **See format coverage across a local set of files.** `hexscope coverage`
+  groups complete, partial and unsupported reads by format, with input sizes
+  and elapsed time. Its JSON report is versioned and contains no file names or
+  finding values; the core crate exposes the same typed scorecard.
+
+### Fixed
+
+- **Unsupported files fail the default incomplete check.** A file hexscope
+  cannot read no longer lets a default `check` run report success as if every
+  input had been inspected. Use `--fail-on none` to report without
+  failing.
+
 ## [0.12.0] — 2026-11-03
 
 ### Changed
@@ -705,7 +750,9 @@ photos, videos, PDFs, Office documents, emails, archives and WebAssembly in
 the browser; says what each gives away; makes clean, redacted and repaired
 copies; and a CLI and GitHub Action for the same checks in CI.
 
-[Unreleased]: https://github.com/MykytaStel/hexscope/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/MykytaStel/hexscope/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/MykytaStel/hexscope/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/MykytaStel/hexscope/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/MykytaStel/hexscope/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/MykytaStel/hexscope/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/MykytaStel/hexscope/compare/v0.9.0...v0.10.0

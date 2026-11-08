@@ -25,8 +25,9 @@ how a version is made is in [releasing.md](releasing.md).
 | 0.9.0 | A lighter page until a file is chosen, large files on phones, sharing from the film lab, browsing large archives | GitHub Release published 2026-10-30; Homebrew tap updated 2026-11-01 |
 | 0.10.0 | Chained Ogg metadata, safer audio clean copies, Ultra HDR clean copies, batch usability and core reliability | shipped 2026-11-02 |
 | 0.11.0 | Hardened clean copies, one wording for every interface, one set of styles, Ogg clean copies | shipped 2026-11-03 |
-| 0.12.0 | Make batch photo privacy mosaic relationships easier to understand and navigate | release candidate; tag and publication pending |
-| 0.13.0 | Trustworthy format coverage scorecard, backed by a local corpus and CI gates | planned; no physical-phone gate |
+| 0.12.0 | Make batch photo privacy mosaic relationships easier to understand and navigate | shipped 2026-11-03 |
+| 0.13.0 | Per-format coverage reports for local inputs, with safer handling of unsupported files | shipped 2026-11-08 |
+| 0.14.0 | Batch coverage in the Web, format-backed quality gates, and verified-copy confidence on phones | shipped 2026-11-08 |
 | 1.0.0 | Stable | when its criteria hold, not before 2026-11-30 |
 
 ### 0.9.0 — shipped 2026-10-30
@@ -117,24 +118,41 @@ makes those relationships actionable in the browser batch:
   explicit. Physical-device checks stay deferred.
 
 The implementation is merged and the post-merge CI and site deploy pass. The
-0.12.0 tag and package publication are pending; physical iPhone and Android
-checks remain explicitly deferred.
+0.12.0 release, its packages and Homebrew update are complete; physical iPhone
+and Android checks remain explicitly deferred.
 
-### 0.13.0 — planned
+### 0.13.0 — shipped 2026-11-08
 
-Expand the existing clean-copy verification matrix into a corpus-backed format
-coverage scorecard:
+`hexscope coverage [--json] PATH...` reports complete, partial and unsupported
+reads by format, with input bytes and elapsed time. The versioned, value-free
+JSON schema contains no file names or finding values; `hexscope-core` exposes
+the typed status and scorecard. A file skipped because its format is
+unsupported now fails the default incomplete check; `--fail-on none` keeps a
+report-only run available.
 
-- Build a deterministic corpus from synthetic fixtures and redistributable
-  samples. Do not add private user files.
-- Track parser completeness, positive and negative findings, clean-copy
-  readback, explicit unchecked cases, runtime and artifact size per format.
-- Add a stable core contract and a value-free CLI report so people and CI can
-  see the same supported claims and their limits.
-- Gate regressions that would turn an unchecked or incomplete result into
-  false reassurance. Keep performance and bundle budgets visible per format.
-- Do not present the scorecard as a safety certification or a single accuracy
-  percentage. Physical-device testing is not a release gate for this scope.
+This 0.13 scorecard describes the supplied local files, not parser accuracy
+or a safety certification. Version 0.14.0 adds a reusable per-format corpus
+with expected findings, clean-copy readback and quality regression gates.
+
+### 0.14.0 — shipped 2026-11-08
+
+Batch coverage now groups complete, partial and unsupported reads by format
+and lets people focus on files that need attention, without sending file
+names or finding values. The clean-copy evidence gate checks all 14 advertised
+formats against deterministic fixtures, including source-to-copy read-back;
+MP3's verification contract only claims fields the ID3 reader inspects.
+Feedback structure reports are opt-in, dependency advisory checks run in CI,
+and mobile downloads preserve their file type. The iPhone save/share flow was
+confirmed by the user. GitHub Release assets cover all five supported
+platform targets, four crates are published, and the Homebrew formula was
+updated and tested.
+
+Android Chrome could not be tested because no Android phone was available.
+The wider physical-device matrix and read-back for Web copies over 10 MiB
+remain open; those outcomes stay explicitly **Not checked** until measured.
+
+The full audit, evidence, secondary maintenance candidates and release gates
+are in [the 0.14 audit](audits/2026-11-08-hexscope-0.14-audit.md).
 
 ### 0.10.0 — shipped 2026-11-02
 
@@ -314,7 +332,7 @@ Hexscope should help a person understand what a file reveals before they share i
 
 ## Principles
 
-- **Local by default:** no file uploads, accounts, telemetry, or server-side inspection. The website counts visitors as daily totals only — no cookie, id or address, nothing about files — read only by the maintainer, from the database (`pnpm stats`).
+- **Local by default:** no file uploads, accounts, user-level tracking, or server-side file inspection. The site stores aggregate visit counts by country, page, device class, language and referring host; it stores no cookie, user ID or IP address in those totals. A feedback message stores the chosen kind and text, optional contact and structure report, page, language, version and browser/system; no file contents or IP address are stored with the message. The maintainer reads stored counts and feedback (`pnpm stats`, `pnpm feedback`).
 - **Evidence before verdict:** explain what was read, what was changed, and what could not be checked.
 - **One core, several interfaces:** keep format facts and conservative decisions in Rust core; expose consistent results to the Web, CLI, and GitHub Action.
 - **Copies stay under user control:** never silently alter the source; keep a successfully produced copy available when post-write verification is incomplete, and refuse to produce one when source content cannot be inspected safely.
