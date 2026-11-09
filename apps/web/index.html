@@ -68,6 +68,7 @@
         <button type="button" data-app-view="overview" aria-current="page">Overview</button>
         <button type="button" data-app-view="metadata">Metadata</button>
         <button type="button" data-app-view="content">Content</button>
+        <button type="button" data-app-view="map">File map</button>
         <button type="button" data-app-view="files" hidden>Files</button>
         <button type="button" data-app-view="structure">Structure</button>
         <button type="button" data-app-view="bytes">Bytes</button>
@@ -331,9 +332,9 @@
             <h3 id="format-video-title">Video &amp; audio</h3>
             <ul class="format-tags" aria-label="Video and audio formats">
               <li><code>MP4</code></li><li><code>QuickTime</code></li><li><code>MOV</code></li><li><code>M4V</code></li>
-              <li><code>MP3</code></li><li><code>FLAC</code></li><li><code>Ogg Vorbis / Opus</code></li>
+              <li><code>WAV</code></li><li><code>MP3</code></li><li><code>FLAC</code></li><li><code>Ogg Vorbis / Opus</code></li>
             </ul>
-            <p class="format-category-note">MP3, FLAC and Ogg tags only; audio is not played.</p>
+            <p class="format-category-note">WAV, MP3, FLAC and Ogg tags only; audio is not played.</p>
           </section>
           <section class="format-category" aria-labelledby="format-documents-title">
             <h3 id="format-documents-title">Documents &amp; Office</h3>
@@ -371,7 +372,7 @@
           <summary>For the curious: look inside a file</summary>
           <div class="geek-more-content">
             <h2 class="doors-title">Look inside</h2>
-            <p class="doors-lede">Why a file won't open, and how it is built: every byte explained, with where its format defines it.</p>
+            <p class="doors-lede">See the parts hexscope recognizes, where they sit in the file, and what the format says about them.</p>
             <div class="doors doors-compact">
               <button class="door" data-sample="samples/broken.png" data-name="broken.png">
                 <svg class="door-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.5 20h19z" /><path d="M12 10v4.5" /><circle cx="12" cy="17.2" r="0.6" class="fill" /></svg>
@@ -387,7 +388,7 @@
               </button>
             </div>
             <ul class="geek-list">
-              <li><strong>Bytes view</strong> — the structure beside the hex, every part with its spec reference</li>
+              <li><strong>Bytes view</strong> — recognized parts beside their bytes, with notes from the format</li>
               <li><strong>Find</strong> <kbd>/</kbd> — text or hex, and the part of the file it falls in</li>
               <li><strong>Compare</strong> — two files, or a file and its clean copy</li>
               <li><strong>JSON</strong> — the whole structure, with its explanations</li>
@@ -436,6 +437,11 @@
               <li><button class="chip" data-sample="samples/wifi.png" data-name="wifi.png"><span class="chip-kind">PNG</span>a Wi-Fi QR code</button></li>
               <li><button class="chip" data-sample="samples/ai-picture.png" data-name="ai-picture.png"><span class="chip-kind">PNG</span>an AI-made picture</button></li>
               <li><button class="chip" data-sample="samples/video.mov" data-name="video.mov"><span class="chip-kind">MOV</span>an iPhone video</button></li>
+              <li><button class="chip" data-sample="samples/sample.wav" data-name="sample.wav"><span class="chip-kind">WAV</span>a WAV recording with metadata</button></li>
+              <li><button class="chip" data-sample="samples/sample.mp3" data-name="sample.mp3"><span class="chip-kind">MP3</span>synthetic ID3 tags; no audio</button></li>
+              <li><button class="chip" data-sample="samples/sample.flac" data-name="sample.flac"><span class="chip-kind">FLAC</span>synthetic stream info; no audio</button></li>
+              <li><button class="chip" data-sample="samples/vorbis.ogg" data-name="vorbis.ogg"><span class="chip-kind">OGG</span>synthetic Vorbis headers; no audio</button></li>
+              <li><button class="chip" data-sample="samples/opus.ogg" data-name="opus.ogg"><span class="chip-kind">OGG</span>synthetic Opus headers; no audio</button></li>
               <li><button class="chip" data-sample="samples/report.docx" data-name="report.docx"><span class="chip-kind">DOCX</span>a Word document</button></li>
               <li><button class="chip" data-sample="samples/budget.xlsx" data-name="budget.xlsx"><span class="chip-kind">XLSX</span>a spreadsheet</button></li>
               <li><button class="chip" data-sample="samples/lease.odt" data-name="lease.odt"><span class="chip-kind">ODT</span>a LibreOffice document</button></li>

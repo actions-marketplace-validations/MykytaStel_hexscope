@@ -8,8 +8,79 @@ change what the CLI's JSON says. How a version is made: [docs/releasing.md](docs
 
 ## [Unreleased]
 
-What is merged but not released yet is in [`changes/`](changes/), a file a
-change; `node scripts/changelog.mjs` shows it as it will read here.
+What is merged but not released yet is in [`changes/`](changes/), with one
+file per change; `node scripts/changelog.mjs` shows how it will read here.
+
+## [0.17.0] — 2026-11-09
+
+### Added
+
+- **Try the audio structure inspectors locally.** The sample picker includes
+  synthetic MP3, FLAC, Ogg Vorbis and Ogg Opus metadata structures. They
+  contain no encoded audio or personal metadata.
+- **Preview SVG drawings safely on-device.** An opt-in static preview removes
+  scripts, event handlers, embedded HTML, styles and external references before
+  the browser renders a bounded uncompressed SVG. The preview does not alter
+  the source file; compressed and oversized drawings remain structure-only.
+- **Read media and code structure by family.** Video files group tracks and
+  stored timing; audio files group tags, pictures, stream blocks and incomplete
+  parts; SVG groups scripts, references and embedded images; email groups
+  sender and route clues, authentication claims, links and attachments; WASM
+  shows imports, exports and debug references. These views do not decode or
+  play media, execute code, verify email claims or visit links.
+- **See what a document package contains.** Office, OpenDocument and EPUB
+  entries are grouped by purpose with local filtering, sizes, compression and
+  clear states for encrypted, incomplete, unsupported or unopened parts.
+  Legacy Office and RTF views explain where their content inspection differs.
+- **Follow PDF pages and structure together.** Page text status, parser
+  findings, page objects, supported pictures, attachments, forms and document
+  actions are grouped in one local navigator. Encrypted page content remains
+  unchecked, and the view states that text inspection does not include OCR.
+- **See image properties apart from metadata.** Pixel dimensions, PNG encoding,
+  orientation, colour profiles, frame counts and auxiliary-image markers are
+  shown where available, with source links to parser nodes. The view does not
+  imply that auxiliary images or animation frames were decoded.
+- **Search and filter findings in one evidence panel.** Privacy, metadata,
+  attachments and unchecked parts can be filtered locally. Findings link to
+  parser nodes, deferred media links to their byte ranges, and read status
+  comes from the parser's coverage result.
+- **Inspect WAV recordings.** Hexscope maps RIFF/WAVE chunks and reads
+  supported INFO and Broadcast Wave metadata. Audio stays undecoded and
+  read-only; a synthetic WAV sample is available in the browser.
+
+### Changed
+
+- **Make evidence controls easier to tap.** On touch devices, source links, filters, search fields and disclosure rows in the inspectors have 44-pixel targets, including wrapped labels.
+
+### Fixed
+
+- **Describe unknown formats accurately.** Hexscope no longer implies that an
+  unrecognized file has no EXIF metadata; it says structural metadata could
+  not be checked and does not offer a clean copy it cannot safely rewrite.
+
+## [0.16.0] — 2026-11-09
+
+### Added
+
+- **Find an affected file from its private batch report.** The on-device list shows the same stable row numbers as the exported report, links to visible problem rows and lets a person jump to any row; names and paths stay out of exports.
+- **Filter a batch from its format coverage.** Select a format in the coverage summary to focus the file list; the batch-wide totals stay visible, and one control clears the filter.
+- **Export complete batch coverage when no file could be read.** The CSV includes an all-files total row so the unread count is visible even when no format was recognized.
+- **See the large-copy read-back limit before cleaning.** Copies are still available above 10 MiB, while findings that could not be read back remain marked **Not checked**.
+- **Explore a file through a map of its byte layout.** The HEIF view also shows primary, derived, tile, thumbnail, auxiliary and metadata items, their references, and available source-byte links. AVIS files show a bounded timing timeline without claiming to decode or play their frames.
+- **Search for possible embedded files without freezing the page.** Signature scans yield, can be cancelled, stay within one total byte budget and a 100-match limit, and say when bytes were not checked. Manual media reads stay local; a signature match is described as a candidate, not a verified attachment.
+- **See the parser's coverage status beside each file.** Complete, partial and unsupported reads are distinguished in the file workspace.
+- **Manage black boxes on a photo before saving a new copy.** Select, move, resize and remove individual regions, undo the last edit, or clear all regions. The editor warns that it re-encodes the picture and may change animation, HDR or color details; the original stays untouched.
+- **See what the PDF redaction preview could read.** Page states show text completeness and extracted pictures, disclose image-read failures and the lack of OCR, and explain that the reconstructed preview may omit unsupported PDF drawing. Failed copy creation restores the controls for another attempt.
+- **Save or share batch coverage and diagnostics as CSV as well as JSON.** The CSV files open as spreadsheets, keep the reports' privacy limits, escape spreadsheet formula cells, and are recognized as CSV downloads. Phones that support file sharing can send the CSV directly to another app or Files.
+
+### Changed
+
+- **Compare two images with an interactive visual wipe.** The bounded previews are labelled as browser-rendered; color and HDR differences remain possible, and metadata is compared separately.
+- **Group recognized photo metadata by category and link each category to its fields.** The summary counts fields and focuses the relevant details when selected.
+
+### Fixed
+
+- **Export diagnostics for an all-failed batch.** The report controls no longer depend on having at least one readable format.
 
 ## [0.15.0] — 2026-11-08
 
@@ -765,7 +836,9 @@ photos, videos, PDFs, Office documents, emails, archives and WebAssembly in
 the browser; says what each gives away; makes clean, redacted and repaired
 copies; and a CLI and GitHub Action for the same checks in CI.
 
-[Unreleased]: https://github.com/MykytaStel/hexscope/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/MykytaStel/hexscope/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/MykytaStel/hexscope/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/MykytaStel/hexscope/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/MykytaStel/hexscope/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/MykytaStel/hexscope/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/MykytaStel/hexscope/compare/v0.12.0...v0.13.0

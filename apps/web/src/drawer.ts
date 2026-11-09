@@ -1,5 +1,5 @@
 import { canBlackOut, openBlackPicture } from "./blackpicture";
-import { findEmbedded, type Embedded } from "./embedded";
+import { findEmbedded, type Embedded, type EmbeddedSearchProgress, type EmbeddedSearchResult } from "./embedded";
 import { blackoutFigure } from "./blackout";
 import { advice } from "./advice";
 import { checkThumbnail, decodePicture, drawn } from "./thumbnail";
@@ -10,15 +10,17 @@ import { done } from "./announce";
 import { recentFiles } from "./recent";
 import { headline, noun } from "./headline";
 import { emailPath } from "./emailpath";
-import { makeupGroup } from "./makeup";
+import { kindOf } from "./files";
 import { el, fact, formatBytes, hasCoarsePointer, hex } from "./dom";
 import { COLOR_TYPES, FACT_LABELS, KEPT, KIND_NAMES, REPAIRABLE, STRONG, degrees, isOpenDocument, mapLink } from "./knowledge";
 import { MAX_COPIED, copyBytes } from "./copybytes";
 import { copyPictureButton, isAudio, shareButton, shareFallbackHint, type CleanActions } from "./cleancard";
 import { createCleaner } from "./cleaner";
 import { forgetPictures, toShown, type Shown } from "./pdf-pictures";
-import { openStructureReport, pdfRedactorPlaceholder, saveStructureJson } from "./drawer-tools";
 import { hasCleanableAudioTags } from "./audio-clean";
+import { evidenceOverview } from "./evidence-overview";
+import { currentLocale, translateText } from "./i18n";
+import type { PageGlyphs } from "./worker";
 
 export type { CleanActions, CleanResult, RepairResult } from "./cleancard";
 
@@ -34,6 +36,67 @@ const METADATA_GROUPS: { key: MetadataGroupKey; title: string }[] = [
 ];
 
 type VerdictKind = ReturnType<typeof verdict>[number]["kind"];
+
+function loadingStatus(className: string, message: string): HTMLElement {
+  const status = el("p", `hint ${className}`, translateText(message, currentLocale()));
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-busy", "true");
+  return status;
+}
+
+const AUTOMATIC_EMBEDDED_SEARCH_BYTES = 16 * 1024 * 1024;
+const EMBEDDED_MEDIA_READ_CHUNK = 1024 * 1024;
+
+/** Pulls deferred media into the existing byte view in small, cancellable reads. */
+async function loadEmbeddedSearchBytes(
+  m: FileModel,
+  maxBytes: number,
+  signal: AbortSignal,
+  onProgress: (loaded: number, total: number) => void,
+): Promise<void> {
+  if (!m.missing || !m.source) return;
+  const limit = Math.min(m.bytes.length, maxBytes);
+  const total = m.missing.wanted(0, limit).reduce((n, [from, to]) => n + to - from, 0);
+  onProgress(0, total);
+
+  for (let from = 0; from < limit; from += EMBEDDED_MEDIA_READ_CHUNK) {
+    const to = Math.min(limit, from + EMBEDDED_MEDIA_READ_CHUNK);
+    for (let attempt = 0; ; attempt++) {
+      if (signal.aborted) throw new DOMException("Embedded file search cancelled", "AbortError");
+      const wanted = m.missing.wanted(from, to);
+      const bytes = wanted.reduce((n, [a, b]) => n + b - a, 0);
+      if (bytes === 0) break;
+      if (await m.missing.fill(m.bytes, m.source, from, to)) {
+        break;
+      }
+      // The byte view may be loading the same small range after a tap. Give
+      // that read time to finish before deciding that the source has failed.
+      if (attempt >= 9) throw new Error("Could not read the file's media bytes.");
+      await new Promise<void>((resolve) => setTimeout(resolve, 16));
+    }
+    const remaining = m.missing.wanted(0, limit).reduce((n, [a, b]) => n + b - a, 0);
+    onProgress(Math.max(0, total - remaining), total);
+  }
+}
+
+/** Keeps signature searches away from media bytes the parser has not loaded. */
+function readableRanges(m: FileModel, ranges: readonly [number, number][]): [number, number][] {
+  const available = m.missing ? m.missing.available(m.bytes.length) : [[0, m.bytes.length] as [number, number]];
+  const out: [number, number][] = [];
+  for (const [from, to] of ranges) {
+    for (const [readFrom, readTo] of available) {
+      const start = Math.max(from, readFrom);
+      const end = Math.min(to, readTo);
+      if (start < end) out.push([start, end]);
+    }
+  }
+  return out;
+}
+
+/** Whether this search actually skipped chunks that are still unloaded. */
+function hasUnreadBytes(m: FileModel, ranges: readonly [number, number][]): boolean {
+  return Boolean(m.missing && ranges.some(([from, to]) => m.missing!.wanted(from, to).length > 0));
+}
 
 const VERDICT_KIND_LABELS: Record<VerdictKind, string> = {
   damage: "Damage",
@@ -66,6 +129,7 @@ export class Drawer {
   private note: string | null = null;
   private readonly node: HTMLElement;
   private readonly file: HTMLElement;
+  private readonly embeddedSearches = new Set<AbortController>();
   /** How many archives the document on screen sits inside. */
   nested = 0;
 
@@ -90,19 +154,42 @@ export class Drawer {
   // Each page's pictures, fetched once per file, when a page is first drawn.
   private pictured: FileModel | null = null;
   private pictureCache = new Map<number, Promise<Shown[]>>();
+  private pictureReadStatus = new Map<number, "loading" | "loaded" | "failed">();
+
+  private setPictureOwner(m: FileModel | null): void {
+    if (m === this.pictured) return;
+    forgetPictures();
+    this.pictured = m;
+    this.pictureCache = new Map();
+    this.pictureReadStatus.clear();
+  }
 
   private picturesOf(m: FileModel, page: number): Promise<Shown[]> {
-    if (m !== this.pictured) {
-      forgetPictures();
-      this.pictured = m;
-      this.pictureCache = new Map();
-    }
+    this.setPictureOwner(m);
     let p = this.pictureCache.get(page);
     if (!p) {
-      p = this.cleaning.pictures(page).then(toShown).catch(() => []);
+      this.pictureReadStatus.set(page, "loading");
+      p = this.cleaning.pictures(page)
+        .then(toShown)
+        .then((pictures) => {
+          if (m !== this.pictured) {
+            forgetPictures(pictures);
+            return [];
+          }
+          this.pictureReadStatus.set(page, "loaded");
+          return pictures;
+        })
+        .catch(() => {
+          if (m === this.pictured) this.pictureReadStatus.set(page, "failed");
+          return [];
+        });
       this.pictureCache.set(page, p);
     }
     return p;
+  }
+
+  private pictureState(m: FileModel, page: number): "loading" | "loaded" | "failed" {
+    return m === this.pictured ? (this.pictureReadStatus.get(page) ?? "loading") : "loading";
   }
 
   /** Moves the keyboard to what was found, without scrolling the page away. */
@@ -111,6 +198,8 @@ export class Drawer {
   }
 
   showFile(m: FileModel | null): void {
+    this.cancelEmbeddedSearches();
+    this.setPictureOwner(m);
     this.file.replaceChildren();
     if (!m) return;
     const f = m.file;
@@ -126,6 +215,27 @@ export class Drawer {
     // nothing away; an archive only when it is a document with properties.
     if (!["zip", "cfb", "unknown"].includes(f.format) || f.facts.length > 0) {
       flow.append(this.reveals(m));
+    }
+    const documentPackage = f.format === "zip" && (
+      f.labels.includes("word/document.xml")
+      || f.labels.includes("xl/workbook.xml")
+      || f.labels.includes("ppt/presentation.xml")
+      || f.labels.includes("META-INF/container.xml")
+      || isOpenDocument(f.labels)
+    );
+    if (["office97", "rtf"].includes(f.format) || documentPackage) {
+      const slot = loadingStatus("document-map-loading", "Loading document map…");
+      flow.append(slot);
+      void import("./document-map")
+        .then(({ documentMap }) => {
+          if (!slot.isConnected) return;
+          const docMap = documentMap(m, (node) => this.onSelect(node), (entry) => this.onOpen(entry), this.nested);
+          if (docMap) slot.replaceWith(docMap);
+          else slot.remove();
+        })
+        .catch(() => {
+          if (slot.isConnected) slot.replaceWith(el("p", "hint", "The document map could not be loaded. The file structure is still available."));
+        });
     }
     // What to do about it, right under the answer: it presses the clean
     // copy's own button, further down, where the result is said.
@@ -151,19 +261,100 @@ export class Drawer {
       answer.querySelector(".verdict-lines")?.after(row);
     }
     // A PDF: black out what you choose, not only what the file already hides.
-    if (f.format === "pdf" && !f.facts.some((x) => x.kind === "encryption")) {
-      flow.append(pdfRedactorPlaceholder(m, this.cleaning, (page) => this.picturesOf(m, page)));
+    if (f.format === "pdf") {
+      let pageRead: Promise<PageGlyphs[]> | null = null;
+      const readPages = () => pageRead ??= this.cleaning.pages().catch((error: unknown) => {
+        pageRead = null;
+        throw error;
+      });
+      const encrypted = f.facts.some((x) => x.kind === "encryption");
+      let redactor: HTMLElement | null = null;
+      if (!encrypted) {
+        redactor = el("div", "group redactor");
+        redactor.setAttribute("aria-busy", "true");
+        redactor.append(el("p", "hint", translateText("Loading PDF tools…", currentLocale())));
+        const redactorSlot = redactor;
+        void import("./drawer-tools")
+          .then(({ pdfRedactorPlaceholder }) => {
+            if (redactorSlot.isConnected) redactorSlot.replaceWith(pdfRedactorPlaceholder(
+              m,
+              { ...this.cleaning, pages: readPages },
+              (page) => this.picturesOf(m, page),
+              (page) => this.pictureState(m, page),
+            ));
+          })
+          .catch(() => {
+            if (!redactorSlot.isConnected) return;
+            redactorSlot.setAttribute("aria-busy", "false");
+            redactorSlot.replaceChildren(el("p", "hint", "PDF tools could not be loaded. The file structure is still available."));
+          });
+      }
+      const slot = loadingStatus("pdf-navigator-loading", "Loading PDF navigator…");
+      flow.append(slot);
+      void import("./pdf-navigator")
+        .then(({ pdfNavigator }) => {
+          if (!slot.isConnected) return;
+          slot.replaceWith(pdfNavigator(
+            m,
+            readPages,
+            (page) => this.picturesOf(m, page),
+            (page) => this.pictureState(m, page),
+            (node) => this.onSelect(node),
+            (entry) => this.onOpen(entry),
+            () => flow.querySelector<HTMLElement>(".redactor")?.scrollIntoView({ behavior: "smooth", block: "start" }),
+          ));
+        })
+        .catch(() => {
+          if (slot.isConnected) slot.replaceWith(el("p", "hint", "The PDF navigator could not be loaded. The file structure is still available."));
+        });
+      if (redactor) {
+        flow.append(redactor);
+      }
     }
     // Technical detail is available in one place, after the useful answer.
     const more = el("details", "more-details");
     more.append(el("summary", undefined, "For the curious"));
     const later = (e: HTMLElement) => more.append(e);
-    more.append(makeupGroup(m, (id) => this.onSelect(id), (id) => this.onHover(id)));
+    const makeupSlot = loadingStatus("makeup-loading", "Loading file structure map…");
+    more.append(makeupSlot);
+    let makeupLoaded = false;
+    more.addEventListener("toggle", () => {
+      if (!more.open || makeupLoaded) return;
+      makeupLoaded = true;
+      void import("./makeup")
+        .then(({ makeupGroup }) => {
+          if (makeupSlot.isConnected) makeupSlot.replaceWith(makeupGroup(m, (id) => this.onSelect(id), (id) => this.onHover(id)));
+        })
+        .catch(() => {
+          if (makeupSlot.isConnected) makeupSlot.replaceWith(el("p", "hint", "The file map could not be loaded. The structure and bytes are still available."));
+        });
+    });
+    if (f.format === "heif") {
+      void import("./heif-map")
+        .then(({ heifMapGroup }) => {
+          if (!more.isConnected) return;
+          const heifMap = heifMapGroup(m, (id) => this.onSelect(id));
+          if (heifMap) more.append(heifMap);
+          if (document.body.dataset.appView === "map") more.open = true;
+        })
+        .catch(() => {
+          if (more.isConnected) more.append(el("p", "hint", "The HEIF map could not be loaded. The file structure is still available."));
+        });
+    }
     const picture = this.picture(m);
     if (picture) later(picture);
 
     const fileGroup = el("div", "group");
     fileGroup.append(el("h2", undefined, "File"));
+    const coverageText = {
+      complete: "The parser read the structures this format supports.",
+      partial: "The parser could not read all supported structures; there may be more findings.",
+      unsupported: "No format-aware parser could read this file; only byte-level details and signature clues are shown.",
+    }[f.coverageStatus];
+    const coverage = el("p", f.coverageStatus === "complete" ? "hint coverage-status" : "problem is-warning coverage-status", coverageText);
+    coverage.dataset.status = f.coverageStatus;
+    coverage.setAttribute("role", "status");
+    fileGroup.append(coverage);
     const grid = el("dl", "facts");
     fact(grid, "Size", `${formatBytes(m.bytes.length)} · ${m.bytes.length.toLocaleString("en")} bytes`);
     if (!f.ihdr && f.dimensions) fact(grid, "Image", `${f.dimensions[0]} × ${f.dimensions[1]}`);
@@ -178,18 +369,72 @@ export class Drawer {
     fileGroup.append(grid);
     const report = el("button", "link report-link", "Report a problem with this file");
     report.title = "Shows the file's layout, without its content, to paste into a bug report";
-    report.addEventListener("click", () => openStructureReport(m));
+    report.addEventListener("click", () => {
+      void import("./drawer-tools")
+        .then(({ openStructureReport }) => openStructureReport(m))
+        .catch(() => this.showNote("Could not load report tools. Try again."));
+    });
     const save = el("button", "link report-link", "Save the structure as JSON");
     save.title = "Every part, its offset, length, value and explanation, nested as in the tree";
-    save.addEventListener("click", () => saveStructureJson(m));
-    const inside = el("button", "link report-link", "Find files inside");
-    inside.title = "Looks through every byte for the start of another file: pictures, archives, documents";
+    save.addEventListener("click", () => {
+      void import("./drawer-tools")
+        .then(({ saveStructureJson }) => saveStructureJson(m))
+        .catch(() => this.showNote("Could not load structure export. Try again."));
+    });
+    const inside = el("button", "link report-link", translateText("Search for embedded files", currentLocale()));
+    inside.title = translateText("Reads the first 256 MiB in small local slices and searches for known file signatures", currentLocale());
+    let activeController: AbortController | null = null;
     inside.addEventListener("click", () => {
-      const parts = m.missing ? m.missing.read(m.bytes.length) : [[0, m.bytes.length]];
-      const found = parts.flatMap(([a, b]) => findEmbedded(m.bytes, a, b, m.file.format === "zip" ? ["zip"] : []));
-      const nowhere = m.missing ? "No other file starts anywhere outside the picture and sound." : "No other file starts anywhere in it.";
-      const list = found.length > 0 ? this.insideList(m, found, "Files inside") : el("p", "hint", nowhere);
-      inside.replaceWith(list);
+      if (activeController) {
+        activeController.abort();
+        inside.disabled = true;
+        const current = fileGroup.querySelector<HTMLElement>(".embedded-search-status .hint");
+        if (current) current.textContent = translateText("Cancelling…", currentLocale());
+        return;
+      }
+      fileGroup.querySelector(".embedded-search-results")?.remove();
+      const controller = this.beginEmbeddedSearch();
+      activeController = controller;
+      const status = this.searchProgress("Searching file signatures…");
+      status.box.append(el("p", "hint", translateText("Media data are read locally in small pieces, up to the first 256 MiB of this file; nothing is uploaded.", currentLocale())));
+      inside.after(status.box);
+      inside.textContent = translateText("Cancel search", currentLocale());
+      const allRanges: [number, number][] = [[0, m.bytes.length]];
+      void (async () => {
+        await loadEmbeddedSearchBytes(m, 256 * 1024 * 1024, controller.signal, (loaded, total) => {
+          status.bar.value = total > 0 ? Math.min(1, loaded / total) : 1;
+          status.detail.textContent = `${translateText("Loading media data…", currentLocale())} · ${formatBytes(loaded)} / ${formatBytes(total)}`;
+        });
+        if (controller.signal.aborted) throw new DOMException("Embedded file search cancelled", "AbortError");
+        status.bar.value = 0;
+        status.detail.textContent = translateText("Searching file signatures…", currentLocale());
+        return findEmbedded(
+          m.bytes,
+          readableRanges(m, allRanges),
+          m.file.format === "zip" ? ["zip"] : [],
+          { signal: controller.signal, onProgress: (progress) => this.updateSearchProgress(status, progress) },
+        );
+      })()
+        .then((result) => {
+          if (!status.box.isConnected) return;
+          status.box.replaceWith(this.embeddedSearchResults(m, result, "Possible embedded files", hasUnreadBytes(m, allRanges)));
+          inside.textContent = translateText("Search for embedded files", currentLocale());
+        })
+        .catch((error: unknown) => {
+          if (!status.box.isConnected) return;
+          if (error instanceof DOMException && error.name === "AbortError") {
+            status.box.replaceChildren(el("p", "hint", translateText("Search cancelled; unsearched bytes remain.", currentLocale())));
+            inside.textContent = translateText("Search for embedded files", currentLocale());
+          } else {
+            status.box.replaceChildren(el("p", "hint", translateText("Could not search this file.", currentLocale())));
+            inside.textContent = translateText("Search for embedded files", currentLocale());
+          }
+        })
+        .finally(() => {
+          this.embeddedSearches.delete(controller);
+          if (activeController === controller) activeController = null;
+          inside.disabled = false;
+        });
     });
     fileGroup.append(report, save, inside);
     // Another file beside this one: what one gives away that the other does not.
@@ -208,6 +453,7 @@ export class Drawer {
     later(fileGroup);
     const share = this.file.querySelector<HTMLElement>(".reveals .sharer");
     if (share) more.append(share);
+    if (document.body.dataset.appView === "map") more.open = true;
     flow.append(more);
 
     // For a ZIP, the stream is whichever entry was last played: not the file's.
@@ -310,12 +556,28 @@ export class Drawer {
     group.append(intro, findings);
     // What the structure leaves over — data after the end, a gap — may be a
     // whole file of its own: say which, and open it.
-    const hidden = m
-      .slices()
-      .filter((sl) => sl.role === Role.Hidden)
-      .flatMap((sl) => findEmbedded(m.bytes, sl.start, sl.start + sl.len));
-    if (hidden.length > 0) findings.append(this.insideList(m, hidden, "Hidden in it"));
-    if (m.file.format !== "unknown") intro.append(el("p", "hint", "Found by reading the file's structure. It is not a virus scan."));
+    const hiddenParts = m.slices().filter((sl) => sl.role === Role.Hidden).map((sl): [number, number] => [sl.start, sl.start + sl.len]);
+    const hiddenRanges = readableRanges(m, hiddenParts);
+    if (hiddenParts.length > 0) {
+      const controller = this.beginEmbeddedSearch();
+      const status = this.searchProgress("Checking hidden data for file signatures…", () => controller.abort());
+      findings.append(status.box);
+      void findEmbedded(m.bytes, hiddenRanges, [], {
+        signal: controller.signal,
+        maxBytes: AUTOMATIC_EMBEDDED_SEARCH_BYTES,
+        onProgress: (progress) => this.updateSearchProgress(status, progress),
+      })
+        .then((result) => {
+          if (!status.box.isConnected) return;
+          status.box.replaceWith(this.embeddedSearchResults(m, result, "Hidden in it", hasUnreadBytes(m, hiddenParts), true));
+        })
+        .catch(() => {
+          if (!status.box.isConnected) return;
+          status.box.replaceChildren(el("p", "hint", "Search cancelled; unsearched bytes remain."));
+        })
+        .finally(() => this.embeddedSearches.delete(controller));
+    }
+    if (m.file.format !== "unknown") intro.append(el("p", "hint", translateText("Found by reading the file's structure. It is not a virus scan.", currentLocale())));
     if (REPAIRABLE.includes(m.file.format) && verdict(m).some((l) => l.kind === "damage")) findings.append(this.repairer());
     return group;
   }
@@ -345,7 +607,13 @@ export class Drawer {
   /** Files found inside this one, each to open or save. */
   private insideList(m: FileModel, found: Embedded[], title: string): HTMLElement {
     const box = el("div", "inside");
-    box.append(el("p", "inside-title", `${title}: ${found.length === 1 ? "1 file" : `${found.length} files`}`));
+    const heading = title === "Hidden in it"
+      ? `${translateText(title, currentLocale())} · ${translateText("Possible file signatures", currentLocale())}`
+      : translateText("Possible file signatures", currentLocale());
+    box.append(
+      el("p", "inside-title", `${heading}: ${found.length}`),
+      el("p", "hint", translateText("These are signature matches, not verified files. Open one to inspect it; this is not a virus scan.", currentLocale())),
+    );
     const ul = el("ul", "inside-list");
     const stem = (m.name.split("/").pop() ?? m.name).replace(/\.[^.]*$/, "");
     for (const e of found) {
@@ -362,10 +630,82 @@ export class Drawer {
       // What it is, where, and how big on one line; what to do with it on the next.
       const actions = el("span", "inside-actions");
       actions.append(open, save);
-      li.append(el("span", "inside-what", `${e.what.charAt(0).toUpperCase()}${e.what.slice(1)}`), at, el("span", "clean-size", formatBytes(e.end - e.start)), actions);
+      const what = translateText(e.what, currentLocale());
+      li.append(el("span", "inside-what", `${what.charAt(0).toLocaleUpperCase(currentLocale())}${what.slice(1)}`), at, el("span", "clean-size", formatBytes(e.end - e.start)), actions);
       ul.append(li);
     }
     box.append(ul);
+    return box;
+  }
+
+  private beginEmbeddedSearch(): AbortController {
+    const controller = new AbortController();
+    this.embeddedSearches.add(controller);
+    return controller;
+  }
+
+  private cancelEmbeddedSearches(): void {
+    for (const controller of this.embeddedSearches) controller.abort();
+    this.embeddedSearches.clear();
+  }
+
+  private searchProgress(label: string, cancel?: () => void): { box: HTMLElement; bar: HTMLProgressElement; detail: HTMLElement } {
+    const box = el("div", "embedded-search-status");
+    box.setAttribute("role", "status");
+    box.setAttribute("aria-live", "polite");
+    const bar = el("progress");
+    bar.max = 1;
+    bar.value = 0;
+    bar.setAttribute("aria-label", translateText("Search progress", currentLocale()));
+    const detail = el("p", "hint", translateText(label, currentLocale()));
+    box.append(bar, detail);
+    if (cancel) {
+      const button = el("button", "link", translateText("Cancel search", currentLocale()));
+      button.addEventListener("click", () => {
+        button.disabled = true;
+        button.textContent = translateText("Cancelling…", currentLocale());
+        cancel();
+      });
+      box.append(button);
+    }
+    return { box, bar, detail };
+  }
+
+  private updateSearchProgress(
+    status: { bar: HTMLProgressElement; detail: HTMLElement },
+    progress: EmbeddedSearchProgress,
+  ): void {
+    status.bar.value = progress.total > 0 ? Math.min(1, progress.searched / progress.total) : 1;
+    status.detail.textContent = `${formatBytes(progress.searched)} / ${formatBytes(progress.total)} · ${progress.matches} ${translateText("found", currentLocale())}`;
+  }
+
+  private embeddedSearchResults(
+    m: FileModel,
+    result: EmbeddedSearchResult,
+    title: string,
+    skipsMedia: boolean,
+    automatic = false,
+  ): HTMLElement {
+    const box = el("div", "embedded-search-results");
+    if (result.matches.length > 0) box.append(this.insideList(m, result.matches, title));
+    else if (skipsMedia && result.searched === 0) {
+      const message = title === "Hidden in it"
+        ? "The hidden data is not loaded for this view, so it was not checked."
+        : "No readable bytes outside the picture and sound were available for this search.";
+      box.append(el("p", "hint", translateText(message, currentLocale())));
+    }
+    else if (title === "Hidden in it") box.append(el("p", "hint", translateText("No known file signatures were found in the hidden bytes checked.", currentLocale())));
+    else box.append(el("p", "hint", translateText("No known file signatures were found in the searched bytes.", currentLocale())));
+
+    if (result.limited) {
+      const message = result.matchLimitReached
+        ? "The result limit was reached; more matches may be present."
+        : automatic
+          ? "Only part of the hidden data was checked automatically; use Search for embedded files for a wider search."
+          : "The search limit was reached; some available bytes were not checked.";
+      box.append(el("p", "hint", translateText(message, currentLocale())));
+    }
+    if (skipsMedia) box.append(el("p", "hint", translateText("Media bytes not loaded for this view were skipped.", currentLocale())));
     return box;
   }
 
@@ -419,11 +759,12 @@ export class Drawer {
       mp3: "What this audio file reveals",
       flac: "What this audio file reveals",
       ogg: "What this audio file reveals",
+      wav: "What this audio file reveals",
       unknown: "What this file reveals",
       eml: "What this email reveals",
       msg: "What this email reveals",
     };
-    const audioFile = ["mp3", "flac", "ogg"].includes(f.format);
+    const audioFile = ["mp3", "flac", "ogg", "wav"].includes(f.format);
     const cleanableAudioTags = hasCleanableAudioTags(f.format, f.labels, f.metadataComplete, f.facts);
     const title = el("h2", undefined, audioFile ? "What this audio file reveals" : isAudio(m) ? "What this recording reveals" : (heading[f.format] ?? "What this document reveals"));
     group.append(title);
@@ -431,6 +772,20 @@ export class Drawer {
     if (f.format === "eml") {
       const path = emailPath(m, (id) => this.onSelect(id));
       if (path) group.append(path);
+    }
+    if (["video", "mp3", "flac", "ogg", "wav", "svg", "eml", "msg", "wasm", "unknown"].includes(f.format)) {
+      const slot = loadingStatus("format-inspector-loading", "Loading format summary…");
+      group.append(slot);
+      void import("./format-inspectors")
+        .then(({ formatInspector }) => {
+          if (!slot.isConnected) return;
+          const details = formatInspector(m, (node) => this.onSelect(node));
+          if (details) slot.replaceWith(details);
+          else slot.remove();
+        })
+        .catch(() => {
+          if (slot.isConnected) slot.replaceWith(el("p", "hint", "The format summary could not be loaded. The file structure is still available."));
+        });
     }
     // The picture it is about, and where it was taken, drawn: what the
     // numbers below mean, before reading them.
@@ -475,31 +830,52 @@ export class Drawer {
           });
       }
     }
+    if (pictured) {
+      const slot = loadingStatus("photo-inspector-loading", "Loading image properties…");
+      group.append(slot);
+      void import("./photo-inspector")
+        .then(({ photoInspector }) => {
+          if (!slot.isConnected) return;
+          const inspector = photoInspector(m, (node) => this.onSelect(node));
+          if (inspector) slot.replaceWith(inspector);
+          else slot.remove();
+        })
+        .catch(() => {
+          if (slot.isConnected) slot.replaceWith(el("p", "hint", "The image properties could not be loaded. The file structure is still available."));
+        });
+    }
     if (!f.location && f.facts.length === 0) {
       // A PNG can hold notes that name no one, such as a comment or the
       // time it was changed: still worth a clean copy.
       const notes = ["tEXt", "zTXt", "iTXt", "eXIf", "tIME", "data after the end of the image"];
       const removable = f.format === "png" && m.children(0).some((id) => notes.includes(m.label(id)));
-      const none =
-        audioFile
-          ? "No supported audio metadata tags were found."
-          : f.format === "pdf"
-          ? "No document information or XMP: nothing about who wrote it, with what, or when."
-          : removable
-            ? "Nothing about the camera, the place or who made it, but it holds notes or data that can go."
-            : f.format === "video"
-              ? isAudio(m)
-                ? "No location, device or software in its metadata."
-                : "No location, camera or software in its metadata."
-              : f.format === "wasm"
-                ? "No names, tools, paths or debug info: nothing about how, or by whom, it was built."
-              : "No EXIF metadata: nothing about the camera, the time or the place.";
+      const none = (() => {
+        if (audioFile) return f.format === "wav"
+          ? "No supported WAV INFO or Broadcast Wave metadata was found."
+          : "No supported audio metadata tags were found.";
+        if (f.format === "pdf") return "No document information or XMP: nothing about who wrote it, with what, or when.";
+        if (removable) return "Nothing about the camera, the place or who made it, but it holds notes or data that can go.";
+        if (f.format === "video") return isAudio(m)
+          ? "No location, device or software in its metadata."
+          : "No location, camera or software in its metadata.";
+        if (f.format === "wasm") return "No names, tools, paths or debug info: nothing about how, or by whom, it was built.";
+        if (f.format === "unknown") return "No structural read was available, so metadata could not be checked.";
+        if (f.format === "eml" || f.format === "msg") return "No supported email findings were read.";
+        if (f.format === "svg" || f.format === "zip" || f.format === "cfb" || f.format === "office97" || f.format === "rtf") return "No supported document metadata findings were read.";
+        if (pictured) return "No EXIF metadata: nothing about the camera, the time or the place.";
+        return "No supported metadata findings were read.";
+      })();
       group.append(el("p", "hint", none));
       if (audioFile && f.metadataComplete === false) {
         group.append(el("p", "hint", "Some audio metadata could not be fully read; the result is partial."));
       }
       if (audioFile && !cleanableAudioTags) {
-        group.append(el("p", "hint", "Read-only metadata inspection. Audio playback is not provided. No clean copy can be made unless supported tags are present and fully checked."));
+        group.append(el("p", "hint", f.format === "wav"
+          ? "WAV metadata is read-only in this release. Audio playback and clean copies are not provided."
+          : "Read-only metadata inspection. Audio playback is not provided. No clean copy can be made unless supported tags are present and fully checked."));
+      }
+      if (f.coverageStatus !== "complete" || f.missing.length > 0 || f.metadataComplete === false) {
+        group.append(evidenceOverview(m, el("div"), (node) => this.onSelect(node), (start, len) => this.onSelectRange(start, len)));
       }
       if (cleanableAudioTags) group.append(createCleaner(m, this.cleaning, group));
       if (removable) group.append(createCleaner(m, this.cleaning, group));
@@ -529,10 +905,11 @@ export class Drawer {
       groupElements.set(key, { section, list, body });
     }
     const generalList = groupElements.get("general")!.list;
-    fact(generalList, "File", f.format === "unknown" ? "Not a format hexscope reads" : f.format.toUpperCase());
+    fact(generalList, "File type", f.format === "unknown" ? "Not a format hexscope reads" : kindOf(m));
     fact(generalList, "Size", `${formatBytes(m.bytes.length)} · ${m.bytes.length.toLocaleString("en")} bytes`);
     const dimensions = f.ihdr ? [f.ihdr[0], f.ihdr[1]] : f.dimensions;
-    if (dimensions) fact(generalList, "Dimensions", `${dimensions[0]} × ${dimensions[1]}`);
+    const isPicture = ["jpeg", "png", "heif", "webp", "gif", "tiff"].includes(f.format);
+    if (dimensions && !isPicture) fact(generalList, "Dimensions", `${dimensions[0]} × ${dimensions[1]}`);
 
     const row = (label: string, text: string, node: number, strong = false, key: MetadataGroupKey = "additional") => {
       const dd = el("dd");
@@ -625,7 +1002,30 @@ export class Drawer {
     if (additionalFacts.some((entry) => STRONG.includes(entry.kind))) {
       groupElements.get("additional")!.body.setAttribute("open", "");
     }
-    group.append(metadataGroups);
+    const metadataSummary = el("nav", "metadata-summary");
+    metadataSummary.setAttribute("aria-label", translateText("Metadata fields found", currentLocale()));
+    metadataSummary.append(el("p", "metadata-summary-title", "Metadata found"));
+    for (const { key, title } of METADATA_GROUPS) {
+      if (key === "general") continue;
+      const section = groupElements.get(key)!.section;
+      const count = Math.floor((section.querySelector("dl")?.children.length ?? 0) / 2);
+      if (count === 0) continue;
+      const label = translateText(title, currentLocale());
+      const jump = el("button", "link metadata-summary-link", `${label} · ${count.toLocaleString(currentLocale())}`);
+      jump.type = "button";
+      jump.addEventListener("click", () => {
+        const details = section.querySelector<HTMLDetailsElement>("details");
+        if (details) details.open = true;
+        section.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        section.querySelector<HTMLButtonElement>(".reveal-link")?.focus({ preventScroll: true });
+      });
+      metadataSummary.append(jump);
+    }
+    if (metadataSummary.children.length > 1) metadataGroups.append(metadataSummary);
+    group.append(
+      evidenceOverview(m, metadataGroups, (node) => this.onSelect(node), (start, len) => this.onSelectRange(start, len)),
+      metadataGroups,
+    );
     if (audioFile && f.metadataComplete === false) {
       group.append(el("p", "hint", "Some audio metadata could not be fully read; the result is partial."));
     }
@@ -640,13 +1040,14 @@ export class Drawer {
     if (f.facts.some((x) => x.kind === "encryption")) {
       group.append(el("p", "hint", "It is encrypted, so hexscope does not make a clean copy of it."));
     } else if (f.format === "unknown") {
-      // Found in its text, not read from its structure: there is nothing to rewrite it by.
-      group.append(el("p", "hint", "hexscope does not take this format apart, so it makes no clean copy of it. The program that made the file keeps these names: change them there, or export a copy without them."));
+      group.append(el("p", "hint", "No clean copy is offered because Hexscope cannot rewrite this file's structure."));
     } else if (f.format === "eml" || f.format === "msg") {
       // A message is read, not sent on as it is: what it says is what the servers wrote.
       group.append(el("p", "hint", "The servers it passed through wrote these lines; an email is not cleaned, but its attached files can be — open one, then save a clean copy of it."));
     } else if (audioFile && !cleanableAudioTags) {
-      group.append(el("p", "hint", "Read-only metadata inspection. Audio playback is not provided. No clean copy can be made unless supported tags are present and fully checked."));
+      group.append(el("p", "hint", f.format === "wav"
+        ? "WAV metadata is read-only in this release. Audio playback and clean copies are not provided."
+        : "Read-only metadata inspection. Audio playback is not provided. No clean copy can be made unless supported tags are present and fully checked."));
     } else {
       group.append(createCleaner(m, this.cleaning, group));
     }

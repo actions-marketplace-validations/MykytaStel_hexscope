@@ -56,6 +56,8 @@ export function kindWord(m: FileModel): string {
       return "FLAC audio";
     case "ogg":
       return "Ogg audio";
+    case "wav":
+      return "WAV audio";
     case "pdf":
       return "PDF";
     case "eml":
@@ -115,6 +117,8 @@ export function kindOf(m: FileModel): string {
       return "Rich Text";
     case "svg":
       return "SVG";
+    case "wav":
+      return "WAV audio";
     default:
       return "";
   }
@@ -157,6 +161,7 @@ const TYPES: Record<string, string> = {
   ods: "application/vnd.oasis.opendocument.spreadsheet",
   odp: "application/vnd.oasis.opendocument.presentation",
   msg: "application/vnd.ms-outlook",
+  csv: "text/csv",
 };
 
 /** The media type a file's name says, or "" when unknown. */

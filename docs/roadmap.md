@@ -28,7 +28,8 @@ how a version is made is in [releasing.md](releasing.md).
 | 0.12.0 | Make batch photo privacy mosaic relationships easier to understand and navigate | shipped 2026-11-03 |
 | 0.13.0 | Per-format coverage reports for local inputs, with safer handling of unsupported files | shipped 2026-11-08 |
 | 0.14.0 | Batch coverage in the Web, format-backed quality gates, and verified-copy confidence on phones | shipped 2026-11-08 |
-| 0.15.0 | Portable batch reports and reliability fixes | accumulating |
+| 0.15.0 | Portable batch reports and reliability fixes | shipped 2026-11-08; Homebrew tap updated 2026-11-09 |
+| 0.16.0 | Private reports, file maps, and safer photo/PDF inspection | shipped 2026-11-09 |
 | 1.0.0 | Stable | when its criteria hold, not before 2026-11-30 |
 
 ### 0.9.0 — shipped 2026-10-30
@@ -155,7 +156,7 @@ remain open; those outcomes stay explicitly **Not checked** until measured.
 The full audit, evidence, secondary maintenance candidates and release gates
 are in [the 0.14 audit](audits/2026-11-08-hexscope-0.14-audit.md).
 
-### 0.15.0 — release candidate
+### 0.15.0 — shipped 2026-11-08
 
 The Web batch workflow now has a versioned coverage report and a separate,
 value-free diagnostics report for rows that need attention. Both can be saved
@@ -166,9 +167,8 @@ retried without reading completed files again.
 
 Core now reads and cleans bounded `.svgz` files, validates gzip integrity and
 checks the cleaned copy by reading it back. Input and expanded XML are each
-limited to 64 MiB, and only one gzip member is accepted. The iPhone share-sheet
-and Files paths for both reports still need the author's physical-device
-check.
+limited to 64 MiB, and only one gzip member is accepted. Physical iPhone
+checks for report sharing and Files downloads remain open.
 
 The Web sample picker and SVG metadata guide include a compressed Inkscape
 example, generated alongside the SVG source, so `.svgz` can be tried without
@@ -179,9 +179,235 @@ outside the photo mosaic, same-repository pull requests reuse their branch-push
 CI run, and advisory scans also cover manifest changes. The advisory workflow
 still runs weekly and on demand; fork pull requests run checks in the base
 repository.
-Android Chrome and read-back for Web clean copies over 10 MiB remain
+The v0.15.0 site and GitHub Release shipped with five CLI archives and
+checksums; all four crates are published. The Homebrew tap was updated on
+2026-11-09, and upgrading from 0.14.0 plus `brew test` passed.
+
+Android Chrome and Web read-back for clean copies over 10 MiB remain
 evidence-gated; browser emulation cannot close those physical-device
 questions.
+
+### 0.16.0 — shipped 2026-11-09
+
+The first slice adds spreadsheet-friendly CSV saves for batch coverage and
+diagnostic reports, alongside the existing versioned JSON. Compatible phones
+can also share those CSV files directly to another app or Files. CSV output
+keeps the same privacy boundary: aggregate counts, or row index, format and
+status; no file names, paths, contents or raw errors. Spreadsheet formula
+cells are escaped, and downloads carry the `text/csv` type.
+
+0.16 completes the private batch-report path: coverage and diagnostics export as
+JSON or CSV, reports remain available when every read fails, CSV includes an
+all-files total row, and a local numbered list links diagnostics back to the
+current batch. Format coverage can focus the matching rows while batch-wide
+totals remain visible. Exports keep their value-free privacy boundary, and
+formula-like CSV cells are escaped.
+
+The file workspace gains a first-class byte-layout map, a HEIF item graph and
+an AVIS timing timeline. The UI labels parser coverage as complete, partial or
+unsupported. Signature search is asynchronous, bounded and cancellable; a
+signature is only a possible match. Photo blackout regions can be edited one
+by one, with clear warnings about re-encoding. PDF pages report text and image
+read status, and the reconstructed preview explains what may be missing.
+Image comparison gains an interactive wipe between two bounded previews.
+
+The pair comparison remains a tool for the two files selected. A repeatable
+multi-pair sharing-path lab is not part of 0.16 and must not be described as
+measuring or certifying a messaging service. Treat it as a separate follow-up
+with explicit pairing, privacy and evidence requirements.
+
+Keep the 10 MiB Web read-back gates and report affected findings as **Not
+checked** when the generated copy cannot be reparsed. JSON/CSV sharing from
+emulated phone profiles has automated coverage; physical iPhone Files
+handoff and Android Chrome remain unverified. Do not raise the limit based on
+emulation alone, and require fixture-backed read, clean and read-back evidence
+for any parser expansion.
+
+The release is live on hexscope.org; the live-site check passed. The published
+GitHub Release has all ten platform archives and checksums, and all four
+crates.io packages are available. The Homebrew tap now points to 0.16.0; an
+upgrade from 0.15.0, `brew test`, and a fresh `cargo install` all report 0.16.0.
+
+### Formats and visual evidence selected for 0.16
+
+- **File anatomy map.** Promote the existing byte composition into a first-class
+  Map view. It remains bounded for large files, follows byte order, exposes a
+  keyboard-operable role legend, and jumps to the source part in Bytes. A merged
+  bar segment points to its largest source slice; the map does not claim that
+  every compressed archive entry is individually visible.
+- **HEIF item graph and AVIF sequence timing.** Show primary, derived, tile,
+  thumbnail, auxiliary and metadata items with their `iref` relationships.
+  Construction method 2 stays explicitly **not assembled** and cannot be
+  mistaken for source bytes. For `avis`, read the `pict` track's `mdhd` timebase
+  and `stts` sample runs into a bounded timeline; this reports stored timing,
+  not decoded or played frames. Apple Live Photo pairs can be selected as a
+  still and a motion clip for side-by-side inspection, but the pairing
+  identifier is not checked.
+- **Image wipe comparison.** When both images fit the existing 16 MiB input
+  bound and a 12-megapixel-per-image preview budget, a keyboard-operable slider
+  reveals one browser-rendered image over the other. JPEG orientation is
+  applied. The display is explicitly approximate; colour and HDR rendering
+  can differ, and parser-backed metadata/structure comparison stays separate.
+
+These views are local and value-free in exported reports. Keep the map's
+segment count bounded, the HEIF item/timing tables bounded, and decode failures
+visible. The image wipe is available only when both previews are within budget;
+manually paired motion previews use the browser's native local video player.
+
+### 0.17.0 — understand the whole file
+
+**Theme:** make the existing format coverage feel like one coherent inspector,
+then deepen each family and add one carefully bounded format. The version starts
+after 0.16.0 ships; this is a scope, not a release date.
+
+The shared inspection path should answer, in order: what this file is; what
+content and metadata were read; what the parser could not check; where each
+finding came from in the structure or bytes; and what a clean copy changes and
+confirms. Reuse the core's typed findings, parse tree, byte ranges, coverage
+state and clean-copy read-back. Do not invent a second confidence model in the
+Web UI. Preserve the detailed byte view as the evidence layer beneath a short
+summary.
+
+#### User-facing scope
+
+1. **Shared evidence overview.** Give each format the same way to reach its
+   summary, content, metadata/privacy, unchecked areas, structure and copy
+   status. Findings link to their source node or byte range when the parser can
+   establish that link. Use the states *found*, *not checked*, *removed and
+   confirmed*, and *still present* only when backed by parser and read-back
+   evidence. Add local search and filters for privacy fields, unchecked items,
+   attachments and metadata. Keep English and Ukrainian wording aligned.
+2. **Photo inspector.** Group visible image properties separately from metadata
+   and privacy findings. Explain GPS, camera identifiers, thumbnails, profiles,
+   animation and auxiliary HEIF/AVIF items when present. Link fields to their
+   bytes or structural item, compare original and clean-copy findings, and
+   provide a bounded visual before/after view. State when image re-encoding can
+   change pixels, HDR, profiles or animation.
+3. **Document map.** For ZIP-based Office, LibreOffice and EPUB, group entries
+   by purpose and surface comments, hidden/deleted content, attachments,
+   compression, encryption, read status and clean-copy outcome. Keep encrypted,
+   unsupported and unread entries explicitly unchecked; link findings to their
+   package entry. For legacy Office and RTF, make the difference between
+   property inspection and document-content inspection clear.
+4. **PDF navigator.** Connect page, text/image read status, finding, object and
+   available action. Surface forms, attachments and document actions in their
+   own groups. Keep OCR absence and reconstructed-preview limits visible; never
+   make a scanned page look text-checked when it was not.
+5. **Media and remaining family polish.** Present video tracks and stored
+   timing separately from decoded media. For MP3/FLAC/Ogg, distinguish tags,
+   cover art and streams, and list unsupported blocks. For SVG/SVGZ, group
+   external references, scripts, embedded images and metadata in a safe local
+   preview. For EML/MSG, separate claimed sender, transport route, links and
+   attachments. For WASM, show imports, exports and dependencies; for unknown
+   files, make the searched byte range and limits explicit.
+6. **New format: WAV.** Add bounded, read-only RIFF/WAVE inspection: chunk map,
+   audio format, channel count, sample rate, bit depth and duration where the
+   parsed fields support it; inspect supported broadcast and INFO metadata with
+   exact source ranges. Do not decode or play audio, and do not offer cleaning
+   until a writer can preserve audio data and prove metadata removal by reading
+   the copy back. Include malformed, truncated, oversized and padded-chunk
+   behavior in the format contract.
+7. **Mobile and learning paths.** Keep the overview, filters, page/entry lists
+   and evidence links usable with keyboard, screen readers, zoom and narrow
+   screens. Add local samples for the main inspectors and connect the existing
+   byte-to-meaning lessons to the selected file where practical.
+
+#### Delivery slices and gates
+
+- **A — shared evidence vocabulary:** map current core facts, coverage states,
+  source ranges and clean-copy receipts into one presentation contract. Begin
+  with photos and documents; avoid a generic abstraction until it is used by
+  more than one family.
+- **B — photo inspector:** ship the grouped view, source links and before/after
+  evidence for supported fixtures.
+- **C — document and PDF maps:** complete package-entry and page navigation,
+  including negative states for encrypted, unsupported and unread content.
+- **D — WAV:** finish core parsing and coverage first, then CLI/Web display and
+  English/Ukrainian guidance. Keep WAV read-only in this release unless its
+  clean-copy evidence is independently complete.
+- **E — family polish and mobile/accessibility pass:** finish the selected
+  audio, video, SVG, email and WASM improvements; add samples and verify the
+  common interaction path across the families touched.
+
+**Implementation started 2026-11-09:** a separate `feat/0-17-format-inspectors`
+branch now contains the first WAV slice. Core and Web recognize RIFF/WAVE,
+read bounded chunk structure plus supported INFO/Broadcast Wave fields, and
+show their source ranges and privacy categories. The file stays read-only and
+audio is never decoded or played. CLI format reporting, Ukrainian copy and a
+synthetic browser sample are wired in. The audio WebAssembly module and its
+explanation catalogue compile.
+
+**Progress 2026-11-09:** the shared evidence panel now filters local findings
+by privacy, metadata, attachments and unchecked parts. Fact rows keep their
+parser-node links; unreadable nodes and deferred media bytes link to their
+source. Its incomplete state comes from the parser's coverage result and parse
+tree, without a second UI confidence score. The complete Web production build
+passes after generating the repository's WASM bindings. The photo card now
+separates visible pixel properties from metadata, links properties to parser
+nodes where available, and names stored frame/auxiliary image data without
+implying that it was decoded. Clean-copy status and visual comparison continue
+to use the Core read-back report and existing bounded browser preview.
+
+The document map groups supported ZIP-based Office, OpenDocument and EPUB
+entries, exposes local name filtering, compression sizes/methods and explicit
+encrypted, incomplete, unsupported and unopened states. Legacy Office and RTF
+explain their different content-read scope. The PDF navigator links pages to
+page objects, groups findings, forms, attachments and document actions, and
+keeps OCR absence and image-read status visible; password-protected PDFs show
+their structural findings while page reading stays disabled. These maps do not
+claim entry-level clean-copy outcomes because Core read-back findings are
+file-scoped. The clean-copy card reports supported removals and its read-back
+result; the map lets someone inspect the output's package parts. PDF facts are
+grouped by page when the parser identifies one, while document-level forms and
+actions remain in their own groups.
+
+This family pass adds bounded source-linked summaries from the existing
+parse tree: video tracks and stored timing, audio tags/artwork/container
+blocks, SVG scripts/references/images, email sender/route claims and links,
+and WebAssembly imports/exports/debug references. These panels do not decode
+media, execute SVG/WebAssembly, verify email authentication claims or fetch
+external references. Unknown files now say that metadata and cleaning were not
+structurally checked, and point to the existing bounded signature search for
+its actual searched range. No per-entry clean-copy removal status is claimed;
+adding that requires a Core verification scope for package parts. The family
+panel implementation is complete, while screen-reader, zoom and physical
+device review remain open.
+Uncompressed SVG up to 2 MiB now has an opt-in static preview;
+the sanitizer strips active content, styles and external references before
+the browser renders it. SVGZ and larger files keep their structural view only.
+The sample picker now includes tiny synthetic MP3, FLAC, Ogg Vorbis and Ogg
+Opus structures alongside the existing WAV sample; these contain no encoded
+audio or personal metadata.
+
+The full Web production build passed after regenerating the repository's WASM
+bindings. Vite still reports existing warnings for static pages that load
+`theme.js` without `type="module"`; the build completes successfully.
+
+The inspector's source links, filters, search fields and disclosure rows now
+keep 44-pixel touch targets on coarse-pointer devices, including wrapped PDF
+findings and package-part names. Native controls retain keyboard focus
+indication and labels.
+This is a code-level accessibility pass; screen-reader, zoom and physical-phone
+checks remain open and are not inferred from the CSS or production build.
+Evidence links select the actual node or byte range in the currently open
+file, where the existing byte-to-meaning explanations are shown. PDF page
+findings are indexed once when page text loads, so filtering pages does not
+rescan the full findings list for each displayed page.
+
+Each slice needs representative fixtures and explicit incomplete/malformed
+behavior. Parser or cleaner changes must retain Core + Web coverage and the
+existing value-free report boundary. Keep physical phone evidence separate from
+browser automation; Android remains open until a device is available. Do not
+raise the 10 MiB Web read-back limit without bounded-memory design and device
+measurements. Web previews never execute file scripts, follow links or decode
+media solely to imply that its contents are safe.
+
+**Release is done when** every included format has an honest read/unchecked
+state; visible findings can reach their evidence when available; clean-copy
+claims agree with read-back; English and Ukrainian cover the new path; and the
+new WAV format is recognized consistently in Core, CLI, Web, coverage and
+documentation. Any family polish that does not meet those gates moves forward
+as a complete slice rather than weakening the evidence contract.
 
 ### 0.10.0 — shipped 2026-11-02
 
