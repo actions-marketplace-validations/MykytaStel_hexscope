@@ -193,13 +193,14 @@ const picture = new PictureView({
 // tap away, and anything that points into the bytes goes there.
 const narrow = matchMedia("(max-width: 900px)");
 
-// On a phone the bar keeps the views of the answer; the structure and the
-// bytes, for the curious, wait under More, which says when one of them is open.
-const expertViews = ["structure", "bytes"].map((v) => appNavigation.querySelector<HTMLElement>(`[data-app-view="${v}"]`)!);
+// File views stay at the top level. Technical inspection is grouped with
+// tools on a phone and gets its own section on wider screens.
+const expertGroup = appNavigation.querySelector<HTMLElement>(".app-nav-inspection")!;
 const moreViews = appNavigation.querySelector<HTMLElement>(".app-nav-more-actions")!;
+const moreMenu = appNavigation.querySelector<HTMLDetailsElement>(".app-nav-more")!;
 function placeExpertViews(): void {
-  if (narrow.matches) moreViews.prepend(...expertViews);
-  else appNavigation.querySelector('[data-app-view="files"]')?.after(...expertViews);
+  if (narrow.matches) moreViews.prepend(expertGroup);
+  else appNavigation.insertBefore(expertGroup, moreMenu);
 }
 placeExpertViews();
 narrow.addEventListener("change", placeExpertViews);
@@ -279,15 +280,7 @@ async function showFiles(): Promise<void> {
   view.show(model.entryOf(selected));
 }
 
-const contentTargetSelector = [
-  ".reveals .reveal-hero",
-  ".reveals .blackout-figure",
-  '.reveals .reveal-list dd[data-kind="hiddentext"]',
-  '.reveals .reveal-list dd[data-kind="covered"]',
-  '.reveals .reveal-list dd[data-kind="deleted"]',
-  '.reveals .reveal-list dd[data-kind="earlier"]',
-  '.reveals .reveal-list dd[data-kind="attachments"] .attachment-open',
-].join(", ");
+const contentTargetSelector = ".reveals > h2";
 
 function syncAppNavigation(): void {
   const model = typeof workspace === "undefined" ? null : workspace?.model;
@@ -305,6 +298,32 @@ function syncAppNavigation(): void {
   }
   if (!narrow.matches) appNavigation.querySelector<HTMLDetailsElement>(".app-nav-more")!.open = true;
 
+  const playerOpen = document.body.classList.contains("is-playing") || playerPending;
+  const playLabel = playBtn.querySelector<HTMLElement>(".btn-label");
+  if (playLabel) {
+    playLabel.textContent = translateText(
+      playerOpen ? "Close player" : "Watch it decompress",
+      currentLocale(),
+    );
+  }
+  playBtn.setAttribute("aria-pressed", String(playerOpen));
+  playBtn.title = translateText(
+    playerOpen ? "Close compression player" : "Step through the DEFLATE decompression (P)",
+    currentLocale(),
+  );
+  const playIcon = playBtn.querySelector<SVGPathElement>("svg path");
+  if (playIcon) playIcon.setAttribute("d", playerOpen ? "M4 4h8v8H4z" : "M4 2.5 13.5 8 4 13.5z");
+
+  const compressionAction = appNavigation.querySelector<HTMLButtonElement>('[data-app-action="compression"]');
+  if (compressionAction) {
+    compressionAction.disabled = !playerOpen && !canPlay();
+    compressionAction.setAttribute("aria-pressed", String(playerOpen));
+    compressionAction.title = translateText(
+      playerOpen ? "Close compression player" : "Step through the DEFLATE decompression (P)",
+      currentLocale(),
+    );
+  }
+
   const hasMetadata = !!$("drawer").querySelector(".reveals");
   const hasContent = !!$("drawer").querySelector(contentTargetSelector);
   const current = document.body.dataset.appView;
@@ -315,10 +334,6 @@ function syncAppNavigation(): void {
       if (view === "files") button.hidden = !isArchive(model);
       if (view === current) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");
-    } else if (button.dataset.appAction === "compression") {
-      const playing = document.body.classList.contains("is-playing") || playerPending;
-      button.disabled = !playing && !canPlay();
-      button.setAttribute("aria-pressed", String(playing));
     }
   }
   // More says it holds the view open now, to the eye and to a screen reader.
@@ -331,8 +346,15 @@ narrow.addEventListener("change", () => {
   if (!narrow.matches && document.body.dataset.state === "ready") syncAppNavigation();
 });
 
-function setWorkspaceView(view: WorkspaceView, scrollToSection = true): void {
+function writeWorkspaceHistory(view: WorkspaceView, replace = false): void {
+  const state = { hexscopeWorkspace: true, hexscopeView: view };
+  if (replace) history.replaceState(state, "", location.href);
+  else history.pushState(state, "", location.href);
+}
+
+function setWorkspaceView(view: WorkspaceView, scrollToSection = true, recordHistory = false): void {
   document.body.dataset.appView = view;
+  if (recordHistory) writeWorkspaceHistory(view, true);
   const makeup = $("drawer").querySelector<HTMLElement>(".more-details > .makeup");
   const details = $("drawer").querySelector<HTMLDetailsElement>(".more-details");
   if (view === "map" && details) details.open = true;
@@ -351,10 +373,6 @@ function setWorkspaceView(view: WorkspaceView, scrollToSection = true): void {
       : view === "map"
         ? makeup
       : null;
-  if (view === "metadata") {
-    // The view of every field: the extra ones too, open.
-    for (const more of $("drawer").querySelectorAll<HTMLDetailsElement>(".metadata-groups details")) more.open = true;
-  }
   if (view === "overview" || view === "metadata") {
     requestAnimationFrame(() => file?.scrollTo({ top: 0, behavior: "smooth" }));
   } else if (target) {
@@ -362,25 +380,65 @@ function setWorkspaceView(view: WorkspaceView, scrollToSection = true): void {
   }
 }
 
+window.addEventListener("popstate", (event: PopStateEvent) => {
+  if (document.body.dataset.state === "batch") return;
+  const state = event.state as { hexscopeWorkspace?: boolean; hexscopeView?: WorkspaceView } | null;
+  if (state?.hexscopeWorkspace && workspace?.model) {
+    document.body.dataset.state = "ready";
+    showFileInfo(workspace.model, workspace.levels);
+    setWorkspaceView(state.hexscopeView ?? "overview", false);
+    updateProblems();
+    playBtn.hidden = !canPlay();
+    return;
+  }
+  if (workspace?.model && document.body.dataset.state === "ready") {
+    // The entry before the first inspected file is the landing page. Keep the
+    // parsed file in memory so Forward can restore the workspace immediately.
+    document.body.dataset.state = "empty";
+    $("fileinfo").replaceChildren();
+    locationBtn.hidden = true;
+    problemsBtn.hidden = true;
+    playBtn.hidden = true;
+    syncAppNavigation();
+    void startDemo($("demo"));
+  }
+});
+
 appNavigation.addEventListener("click", (event) => {
   const button = (event.target as Element | null)?.closest<HTMLButtonElement>("button");
   if (!button || button.disabled) return;
-  // A phone's More closes on whatever was chosen in it.
-  if (narrow.matches) button.closest<HTMLDetailsElement>(".app-nav-more")?.removeAttribute("open");
+  // Tools live inside the same mobile overlay as views, so dismiss it for
+  // transitions before a dialog or player takes focus. Keep it open while
+  // Compare's native picker is pending, so cancelling doesn't hide the action.
+  const compareAction = button.dataset.appAction === "compare";
+  if (narrow.matches && !compareAction) moreMenu.removeAttribute("open");
   if (button.dataset.appView) {
-    if (playerPending) closePlayer();
+    delete appNavigation.dataset.inspectorRequested;
+    const nextView = button.dataset.appView as WorkspaceView;
+    const sameView = nextView === document.body.dataset.appView;
+    const playerOpen = playerPending || document.body.classList.contains("is-playing");
+    if (playerOpen) closePlayer();
     tourDismissedByNavigation = true;
     dismissTour();
-    setWorkspaceView(button.dataset.appView as WorkspaceView);
+    // Close an open player, but don't reapply the active page's layout or scroll.
+    if (sameView) return;
+    // Workspace tabs are one browser-history entry. Replacing its state keeps
+    // Back/Forward for leaving and restoring the inspected file, without
+    // leaving stale entries for files that have since been replaced.
+    setWorkspaceView(nextView, true, true);
     return;
   }
   tourDismissedByNavigation = true;
   dismissTour();
-  button.closest<HTMLDetailsElement>(".app-nav-more")?.removeAttribute("open");
   if (button.dataset.appAction === "compression") {
-    if (document.body.classList.contains("is-playing") || playerPending) closePlayer();
-    else if (canPlay()) void openPlayer();
-  } else if (button.dataset.appAction === "compare") {
+    if (playerPending || player?.isOpen) closePlayer();
+    else {
+      toBytes();
+      void openPlayer();
+    }
+    return;
+  }
+  if (button.dataset.appAction === "compare") {
     comparePicker.click();
   }
 });
@@ -388,7 +446,10 @@ appNavigation.addEventListener("click", (event) => {
 comparePicker.addEventListener("change", () => {
   const file = comparePicker.files?.[0];
   comparePicker.value = "";
-  if (file) void compareWith(file);
+  if (file) {
+    if (narrow.matches) moreMenu.removeAttribute("open");
+    void compareWith(file);
+  }
 });
 
 let tourDismissedByNavigation = false;
@@ -1038,7 +1099,10 @@ function renderFile(m: FileModel, levels: readonly WorkspaceLevel[]): void {
   drawer.showFile(m);
   drawer.showNode(m, -1, false);
   showFileInfo(m, levels);
-  setWorkspaceView(openingView() === "bytes" ? "bytes" : "overview", false);
+  const initialView = openingView() === "bytes" ? "bytes" : "overview";
+  setWorkspaceView(initialView, false);
+  const currentState = history.state as { hexscopeWorkspace?: boolean } | null;
+  writeWorkspaceHistory(initialView, currentState?.hexscopeWorkspace === true);
   updateProblems();
   playBtn.hidden = !canPlay();
   syncAppNavigation();

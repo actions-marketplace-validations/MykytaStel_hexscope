@@ -70,9 +70,16 @@ struct Item {
 struct Loc {
     id: u32,
     method: u8,
+    data_reference_index: u16,
     base: u64,
-    extents: Vec<(u64, u64)>,
+    extents: Vec<Extent>,
     node: NodeId,
+}
+
+struct Extent {
+    index: u64,
+    offset: u64,
+    length: u64,
 }
 
 struct Ref {
@@ -465,8 +472,18 @@ fn decode(
             }
         }
         "colr" => {
-            f.cc("colourType")?;
-            f.rest("colourData");
+            let colour_type = f.cc("colourType")?;
+            if matches!(colour_type.as_str(), "prof" | "rICC") {
+                let profile_at = f.at;
+                let profile = data.get(profile_at as usize..end as usize)?;
+                let source = ByteRange::new(profile_at, end - profile_at);
+                f.rest("profile data");
+                crate::icc::add_profile(f.tree, node, profile, source, &mut |offset, len| {
+                    ByteRange::new(profile_at + offset, len)
+                });
+            } else {
+                f.rest("colourData");
+            }
         }
         "ipma" => {
             f.full_box()?;
@@ -515,19 +532,25 @@ fn iloc(f: &mut Fields, ctx: &mut Ctx) -> Option<()> {
             } else {
                 0
             };
-            f.num("dataReferenceIndex", 2)?;
+            let data_reference_index = f.num("dataReferenceIndex", 2)? as u16;
             let base = f.var("baseOffset", base_size)?;
             let n = f.num("extentCount", 2)?;
             let mut extents = Vec::new();
             for _ in 0..n.min(MAX_ITEMS as u64) {
-                if index_size > 0 {
-                    f.var("extentIndex", index_size)?;
-                }
+                let index = if index_size > 0 {
+                    f.var("extentIndex", index_size)?
+                } else {
+                    1 // ISO/IEC 14496-12: index_size == 0 implies index 1.
+                };
                 let off = f.var("extentOffset", off_size)?;
                 let len = f.var("extentLength", len_size)?;
-                extents.push((off, len));
+                extents.push(Extent {
+                    index,
+                    offset: off,
+                    length: len,
+                });
             }
-            Some((method, base, extents))
+            Some((method, data_reference_index, base, extents))
         })();
         f.parent = outer;
         // The node was added before its length was known; it gets its real
@@ -538,10 +561,11 @@ fn iloc(f: &mut Fields, ctx: &mut Ctx) -> Option<()> {
         );
         f.tree
             .relabel(node, label, ByteRange::new(start, f.at - start));
-        let (method, base, extents) = read?;
+        let (method, data_reference_index, base, extents) = read?;
         ctx.locs.push(Loc {
             id: id?,
             method,
+            data_reference_index,
             base,
             extents,
             node,
@@ -570,12 +594,29 @@ fn place_items(doc: &mut HeifDocument, data: &[u8], ctx: &Ctx, root: NodeId, dep
         let Some(item) = ctx.items.iter().find(|i| i.id == loc.id) else {
             continue;
         };
-        for (k, &(off, n)) in loc.extents.iter().enumerate() {
-            let start = match loc.method {
-                0 => loc.base.checked_add(off),
+        for (k, extent) in loc.extents.iter().enumerate() {
+            let range = match loc.method {
+                0 => loc
+                    .base
+                    .checked_add(extent.offset)
+                    .map(|start| (start, extent.length)),
                 1 => ctx
                     .idat
-                    .and_then(|(s, _, _)| s.checked_add(loc.base)?.checked_add(off)),
+                    .and_then(|(s, _, _)| s.checked_add(loc.base)?.checked_add(extent.offset))
+                    .map(|start| (start, extent.length)),
+                2 => match method2_extent(ctx, loc, extent, len) {
+                    Ok(range) => Some((range.start, range.len)),
+                    Err(reason) => {
+                        doc.tree.add(
+                            Some(loc.node),
+                            format!("construction method 2: {reason}"),
+                            ByteRange::new(0, 0),
+                            NodeKind::Field,
+                            None,
+                        );
+                        None
+                    }
+                },
                 m => {
                     doc.tree.add(
                         Some(loc.node),
@@ -587,9 +628,13 @@ fn place_items(doc: &mut HeifDocument, data: &[u8], ctx: &Ctx, root: NodeId, dep
                     None
                 }
             };
-            let Some(start) = start else { continue };
+            let Some((start, mut n)) = range else {
+                continue;
+            };
             // A zero length means "to the end", which only a lone extent can say.
-            let n = if n == 0 { len.saturating_sub(start) } else { n };
+            if n == 0 {
+                n = len.saturating_sub(start);
+            }
             if start.checked_add(n).is_none_or(|e| e > len) {
                 doc.tree.error(
                     loc.node,
@@ -667,6 +712,105 @@ fn place_items(doc: &mut HeifDocument, data: &[u8], ctx: &Ctx, root: NodeId, dep
     {
         let xmp = crate::exif::xmp::from_xmp(&String::from_utf8_lossy(bytes), node);
         doc.facts.fill_from(xmp);
+    }
+}
+
+/// Resolves an item-offset extent when its requested bytes fit within one
+/// explicit, local extent of the referenced item. Item data is the
+/// concatenation of its extents, but a range crossing a source-extent boundary
+/// cannot be represented by one file range and remains unread.
+fn method2_extent(
+    ctx: &Ctx,
+    loc: &Loc,
+    extent: &Extent,
+    file_len: u64,
+) -> Result<ByteRange, &'static str> {
+    if loc.data_reference_index != 0 {
+        return Err("external data references are not read");
+    }
+    let ref_index = usize::try_from(
+        extent
+            .index
+            .checked_sub(1)
+            .ok_or("extent index 0 is reserved")?,
+    )
+    .map_err(|_| "extent reference index is too large")?;
+    let target = ctx
+        .refs
+        .iter()
+        .filter(|r| r.typ == "iloc" && r.from == loc.id)
+        .flat_map(|r| r.to.iter())
+        .nth(ref_index)
+        .copied()
+        .ok_or("no matching iloc item reference was found")?;
+    let source = ctx
+        .locs
+        .iter()
+        .find(|source| source.id == target)
+        .ok_or("the referenced item has no location")?;
+    if source.method > 1 || source.data_reference_index != 0 {
+        return Err("the referenced item is not stored directly in this file");
+    }
+    if source.extents.is_empty() {
+        return Err("the referenced item has no extents");
+    }
+    if extent.length == 0 {
+        return Err("an explicit extent length is required for item-offset reads");
+    }
+    let item_offset = loc
+        .base
+        .checked_add(extent.offset)
+        .ok_or("the item offset overflows")?;
+    let item_end = item_offset
+        .checked_add(extent.length)
+        .ok_or("the item extent length overflows")?;
+
+    let mut logical_start = 0u64;
+    for source_extent in &source.extents {
+        if source_extent.length == 0 {
+            return Err("the referenced item has an implicit extent length");
+        }
+        let source_start = match source.method {
+            0 => source.base.checked_add(source_extent.offset),
+            1 => ctx.idat.and_then(|(start, _, _)| {
+                start
+                    .checked_add(source.base)?
+                    .checked_add(source_extent.offset)
+            }),
+            _ => None,
+        }
+        .ok_or("the referenced item's location overflows")?;
+        let source_end = source_start
+            .checked_add(source_extent.length)
+            .ok_or("the referenced item's length overflows")?;
+        let in_item_data = ctx
+            .mdat
+            .iter()
+            .any(|(r, _)| source_start >= r.start && source_end <= r.end())
+            || ctx
+                .idat
+                .is_some_and(|(_, _, r)| source_start >= r.start && source_end <= r.end());
+        if source_end > file_len || !in_item_data {
+            return Err("the referenced item's extent is outside bounded item data");
+        }
+        let logical_end = logical_start
+            .checked_add(source_extent.length)
+            .ok_or("the referenced item's length overflows")?;
+        if item_offset >= logical_start && item_end <= logical_end {
+            let start = source_start
+                .checked_add(item_offset - logical_start)
+                .ok_or("the resolved item offset overflows")?;
+            return Ok(ByteRange::new(start, extent.length));
+        }
+        if item_offset < logical_end && item_end > logical_end {
+            return Err("the requested range crosses a referenced-item extent boundary");
+        }
+        logical_start = logical_end;
+    }
+    if item_end > logical_start {
+        Err("the requested range runs past the referenced item")
+    } else {
+        Err("the requested range does not fit within one referenced-item extent")
     }
 }
 
@@ -850,5 +994,150 @@ mod tests {
         mp4.extend_from_slice(b"ftypisom\0\0\0\0isomavc1");
         assert!(!is_heif(&mp4));
         assert!(!is_heif(b"not even close"));
+    }
+
+    fn method2_context(source_method: u8, source_extents: Vec<Extent>) -> (Ctx, Loc) {
+        let source = Loc {
+            id: 7,
+            method: source_method,
+            data_reference_index: 0,
+            base: 0,
+            extents: source_extents,
+            node: 0,
+        };
+        let item = Loc {
+            id: 9,
+            method: 2,
+            data_reference_index: 0,
+            base: 0,
+            extents: Vec::new(),
+            node: 0,
+        };
+        let mut ctx = Ctx {
+            locs: vec![source],
+            refs: vec![Ref {
+                typ: "iloc".into(),
+                from: item.id,
+                to: vec![7],
+            }],
+            ..Ctx::default()
+        };
+        if source_method == 1 {
+            ctx.idat = Some((100, 0, ByteRange::new(100, 40)));
+        } else {
+            ctx.mdat.push((ByteRange::new(0, 64), 0));
+        }
+        (ctx, item)
+    }
+
+    #[test]
+    fn method2_maps_ranges_inside_each_extent_of_a_local_item() {
+        let (ctx, item) = method2_context(
+            0,
+            vec![
+                Extent {
+                    index: 1,
+                    offset: 8,
+                    length: 4,
+                },
+                Extent {
+                    index: 1,
+                    offset: 28,
+                    length: 6,
+                },
+            ],
+        );
+        for (offset, length, expected) in [(1, 2, 9), (5, 3, 29)] {
+            let range = method2_extent(
+                &ctx,
+                &item,
+                &Extent {
+                    index: 1,
+                    offset,
+                    length,
+                },
+                64,
+            )
+            .unwrap();
+            assert_eq!(range, ByteRange::new(expected, length));
+        }
+    }
+
+    #[test]
+    fn method2_keeps_ranges_crossing_extent_boundaries_unread() {
+        let (ctx, item) = method2_context(
+            0,
+            vec![
+                Extent {
+                    index: 1,
+                    offset: 8,
+                    length: 4,
+                },
+                Extent {
+                    index: 1,
+                    offset: 28,
+                    length: 6,
+                },
+            ],
+        );
+        let error = method2_extent(
+            &ctx,
+            &item,
+            &Extent {
+                index: 1,
+                offset: 3,
+                length: 3,
+            },
+            64,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "the requested range crosses a referenced-item extent boundary"
+        );
+    }
+
+    #[test]
+    fn method2_maps_fragmented_idat_items_and_bounds_the_item_offset() {
+        let (ctx, item) = method2_context(
+            1,
+            vec![
+                Extent {
+                    index: 1,
+                    offset: 2,
+                    length: 3,
+                },
+                Extent {
+                    index: 1,
+                    offset: 14,
+                    length: 5,
+                },
+            ],
+        );
+        let range = method2_extent(
+            &ctx,
+            &item,
+            &Extent {
+                index: 1,
+                offset: 4,
+                length: 2,
+            },
+            140,
+        )
+        .unwrap();
+        assert_eq!(range, ByteRange::new(115, 2));
+
+        let error = method2_extent(
+            &ctx,
+            &item,
+            &Extent {
+                index: 1,
+                offset: 8,
+                length: 1,
+            },
+            140,
+        )
+        .unwrap_err();
+        assert_eq!(error, "the requested range runs past the referenced item");
     }
 }

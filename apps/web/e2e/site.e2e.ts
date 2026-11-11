@@ -725,7 +725,7 @@ test("photo metadata is grouped and its location still opens the exact bytes", a
   await page.goto("./?sample=photo.jpg");
   await expect(page.locator(".verdict-title")).toBeVisible();
 
-  // On the overview the extra fields wait folded; the Metadata view opens them.
+  // Extra fields stay folded until someone opens that group.
   const folded = page.locator("#drawer .metadata-group[data-metadata-group='additional'] details");
   await expect(folded).not.toHaveAttribute("open", "");
   const metadataNav = page.locator("#app-nav [data-app-view='metadata']");
@@ -741,8 +741,8 @@ test("photo metadata is grouped and its location still opens the exact bytes", a
 
   const additional = metadata.locator(".metadata-group[data-metadata-group='additional']");
   await expect(additional).toContainText("Додаткові поля");
-  if (await metadataNav.isVisible()) await expect(additional.locator("details")).toHaveAttribute("open", "");
-  else await additional.locator("summary").click();
+  await expect(additional.locator("details")).not.toHaveAttribute("open", "");
+  await additional.locator("summary").click();
   await expect(additional.locator("dd[data-kind='thumbnail']")).toBeVisible();
 
   const locationRow = metadata.locator(".metadata-group[data-metadata-group='location'] dd[data-kind='location']");
@@ -976,8 +976,17 @@ test("phone analyzer exposes all workspace views and secondary actions", async (
 
   const comparePicker = page.waitForEvent("filechooser");
   await compare.click();
-  await comparePicker;
+  const picker = await comparePicker;
+  await expect(more).toHaveAttribute("open", "");
+  await expect(compare).toBeVisible();
+  await picker.setFiles(sample("report.docx"));
+  const comparison = page.locator("dialog.compare");
+  await expect(comparison).toBeVisible();
   await expect(more).not.toHaveAttribute("open", "");
+  await page.keyboard.press("Escape");
+  await expect(comparison).not.toBeVisible();
+  await more.locator("summary").click();
+  await expect(compare).toBeVisible();
 
   await page.setViewportSize({ width: 320, height: 740 });
   await expect(page.locator("html")).toHaveJSProperty("scrollWidth", 320);

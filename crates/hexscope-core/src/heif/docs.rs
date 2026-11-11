@@ -238,6 +238,10 @@ const TABLE: Table = &[
         heif("The colour space's numbers, or the profile."),
     ),
     (
+        "profile data",
+        heif("The ICC profile carried by this colour property."),
+    ),
+    (
         "associations",
         heif("For each item, the numbers of its properties."),
     ),
@@ -252,7 +256,7 @@ const TABLE: Table = &[
     ("itemCount", heif("How many items have locations.")),
     (
         "constructionMethod",
-        heif("Where the offsets count from: 0 the file, 1 the idat box."),
+        heif("Where an item's bytes come from: 0 the file, 1 idat data, 2 another item."),
     ),
     (
         "dataReferenceIndex",
@@ -280,7 +284,9 @@ const TABLE: Table = &[
     ),
     (
         "construction method *",
-        heif("An item made from other items' bytes, which this tool does not assemble."),
+        heif(
+            "An item built from another item. This view maps ranges inside one stored extent; ranges across extent boundaries, chained items and external data remain unread.",
+        ),
     ),
     // Problems.
     (
