@@ -1,5 +1,20 @@
 # Hexscope roadmap
 
+## Audit follow-up: publication tools and reliability
+
+The 2026-11-11 implementation adds bounded input/tree admission, worker
+recovery deadlines, stronger cleaner fuzz invariants, typed inspection status,
+shared Core publication profiles/plans, semantic comparison, copy packages,
+local OCR suggestions, evidence origins and a synthetic damage laboratory.
+See [publication tools](publication-tools.md) and the
+[implementation record](audits/2026-11-11-audit-implementation.md).
+
+The next acceptance gate is physical iPhone/Android behavior, HDR display,
+VoiceOver/TalkBack and measured OCR recall/false positives on a representative
+corpus. Automated browser profiles and a synthetic OCR example do not close
+that gate. No release version is published by this change.
+
+
 This is the project's shared product and engineering roadmap. It describes priorities and decision gates, not release dates. Work moves forward in small, reviewable slices; a feature is not considered complete until the user-facing behavior, CLI/core parity where applicable, tests, and hosted state agree.
 
 ## Versions — what we do and when
@@ -32,6 +47,7 @@ how a version is made is in [releasing.md](releasing.md).
 | 0.16.0 | Private reports, file maps, and safer photo/PDF inspection | shipped 2026-11-09 |
 | 0.17.0 | Source-linked inspectors across file families, plus bounded WAV inspection | shipped 2026-11-09 |
 | 0.18.0 | Verified WAV cleaning and deeper format inspection | shipped 2026-11-10 |
+| 0.19.0 | Evidence-led publication workflows, local OCR, and responsive polish | release preparation |
 | 1.0.0 | Stable | when its criteria hold, not before 2026-11-30 |
 
 ### 0.9.0 — shipped 2026-10-30
@@ -487,6 +503,28 @@ encrypted bytes or unknown extension bytes were read. Each user-facing change
 gets its own `changes/` fragment.
 Screen-reader, zoom, and physical-device gaps recorded during 0.17 remain
 open for the 1.0 acceptance checklist.
+
+### 0.19.0 — evidence-led publishing and responsive workflows (release preparation)
+
+**Theme:** let people check publication rules, make and verify portable copies,
+and follow evidence without overstating parser coverage or OCR certainty.
+
+The accumulated scope adds local publication profiles shared by Web and CLI,
+batch preflight, value-free receipts and summaries, in-browser copy-receipt
+verification, and an opt-in local OCR path for images and an extracted PDF
+picture. OCR suggestions require manual confirmation. The release also includes
+bounded worker and memory handling, source-linked finding paths, clearer
+comparison coverage, and responsive controls for narrow screens. See the
+version changelog for the user-facing change list.
+
+**Release gates:** build and test the exact versioned commit, pass hosted CI,
+inspect the production build and release assets, and verify package metadata
+before publishing. The desktop and emulated mobile visual pass covers 1440,
+390 and 320 pixel widths, dark and light themes, and English and Ukrainian.
+Physical iPhone/Android, screen-reader and user-comprehension checks remain
+unverified; browser emulation does not satisfy them. OCR has synthetic
+integration evidence, not a measured recall or false-positive rate on a real
+corpus. Publishing crates remains a separate decision.
 
 ### 0.10.0 — shipped 2026-11-02
 
