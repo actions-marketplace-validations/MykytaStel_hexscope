@@ -1043,12 +1043,15 @@ test("phone tree selection opens a compact, non-modal inspector while bytes rema
     const geometry = await sheet.evaluate((dialog) => {
       const dock = dialog.getBoundingClientRect();
       const nav = document.querySelector(".app-nav")!.getBoundingClientRect();
+      const bytes = document.querySelector(".pane-hex")!.getBoundingClientRect();
       return {
         left: dock.left,
         right: dock.right,
         height: dock.height,
+        top: dock.top,
         bottom: dock.bottom,
         navTop: nav.top,
+        bytesBottom: bytes.bottom,
         navVisible: getComputedStyle(document.querySelector(".app-nav")!).display !== "none",
       };
     });
@@ -1056,6 +1059,7 @@ test("phone tree selection opens a compact, non-modal inspector while bytes rema
     expect(geometry.right, `${width}px dock right inset`).toBeLessThanOrEqual(width - 7);
     expect(geometry.height, `${width}px collapsed dock height`).toBeLessThanOrEqual(76);
     expect(geometry.bottom, `${width}px dock stays above navigation`).toBeLessThanOrEqual(geometry.navTop + 1);
+    expect(geometry.bytesBottom, `${width}px byte pane clears the inspector dock`).toBeLessThanOrEqual(geometry.top - 1);
     expect(geometry.navVisible, `${width}px navigation remains visible`).toBe(true);
     await expect(page.locator("html"), `${width}px no horizontal overflow`).toHaveJSProperty("scrollWidth", width);
   }
@@ -1081,6 +1085,13 @@ test("phone tree selection opens a compact, non-modal inspector while bytes rema
   await details.click();
   await expect(details).toHaveAttribute("aria-expanded", "true");
   await expect(sheet.locator(".drawer-node")).toBeVisible();
+  const expandedGeometry = await sheet.evaluate((dialog) => ({
+    top: dialog.getBoundingClientRect().top,
+    bytesBottom: document.querySelector(".pane-hex")!.getBoundingClientRect().bottom,
+  }));
+  expect(expandedGeometry.bytesBottom, "expanded inspector must keep the byte pane visible above it").toBeLessThanOrEqual(expandedGeometry.top - 1);
+  const readingHeight = await page.locator(".hex-scroller").evaluate((element) => element.clientHeight);
+  expect(readingHeight, "expanded inspector leaves several byte rows in view").toBeGreaterThanOrEqual(120);
 
   const secondRow = page.locator("#tree .tree .row").nth(1);
   await secondRow.click();
@@ -1322,7 +1333,7 @@ test("keeps the mobile landing menu compact and aligned below the header", async
   const summary = page.locator(".landing-menu > summary");
   const button = await summary.boundingBox();
   expect(button).not.toBeNull();
-  expect(button!.height).toBeLessThanOrEqual(36);
+  expect(button!.height).toBeGreaterThanOrEqual(44);
   // The header's Open repeats the landing's own button: hidden while that one shows.
   const headerOpen = page.locator(".topbar .actions > .btn[data-opens='picker']");
   await expect(headerOpen).toBeHidden();
@@ -1370,6 +1381,15 @@ async function openDoor(page: Page, door: RegExp): Promise<void> {
   }
   await target.click();
   await expect(page.locator(".verdict-title")).toBeVisible();
+}
+
+/** Additional metadata is deliberately folded until a reader opens it. */
+async function showAdditionalFields(page: Page): Promise<void> {
+  const details = page.locator("#drawer .metadata-additional-details");
+  await expect(details).toBeVisible();
+  if (!(await details.evaluate((element) => (element as HTMLDetailsElement).open))) {
+    await details.locator(":scope > summary").click();
+  }
 }
 
 /** Downloads are written nowhere: each is noted and cancelled. */
@@ -2086,12 +2106,21 @@ test("the phone can inspect a photo in Ukrainian and return to its clean-copy ac
   await expect(inspector.locator(".drawer-node")).toContainText("Довжина");
   await expect(inspector.locator(".drawer-node")).toContainText("Тип");
   await expect(inspector.locator(".drawer-node")).toContainText("Копіювати як");
+  const repeatedSelection = page.locator("#statusbar-selection");
+  const fileSize = page.locator("#statusbar-size");
+  await expect(repeatedSelection).toHaveCount(1);
+  await expect(repeatedSelection).toBeHidden();
+  await expect(fileSize).toBeVisible();
+  const [status, size] = await Promise.all([page.locator("#status").boundingBox(), fileSize.boundingBox()]);
+  expect(status && size).toBeTruthy();
+  expect(Math.abs(status!.y + status!.height / 2 - size!.y - size!.height / 2)).toBeLessThanOrEqual(2);
   const copyBottom = await inspector.locator(".copy-bytes").evaluate((el) => Math.ceil(el.getBoundingClientRect().bottom));
   const drawerBottom = await inspector.locator(".drawer-node").evaluate((el) => Math.floor(el.getBoundingClientRect().bottom));
   expect(copyBottom).toBeLessThanOrEqual(drawerBottom);
   expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(0);
 
   await inspector.getByRole("button", { name: "Закрити" }).click();
+  await expect(repeatedSelection).toBeVisible();
   await page.locator("#app-nav [data-app-view='overview']").click();
   await expect(page.locator(".verdict-cta")).toBeVisible();
 });
@@ -2701,6 +2730,9 @@ test("a fake bank email: why it may not be real, drawn on its way", async ({ pag
 test("a blacked-out PDF: the names still under its boxes", async ({ page }) => {
   await openDoor(page, /Check a document before you send it/);
   await expect(page.locator(".verdict-title")).toHaveText(/^This PDF gives away \d+ things$/);
+  await showAdditionalFields(page);
+  await expect(page.locator("#drawer .metadata-priority-block")).toBeVisible();
+  await expect(page.locator("#drawer .metadata-secondary-fields")).toBeVisible();
   await expect(page.locator(".reveal-list")).toContainText("Olena Koval");
 });
 
@@ -3143,6 +3175,7 @@ test("an Outlook message is read as an email, and an old Word file is cleaned", 
   const saved = catchDownloads(page);
   await page.goto("./?sample=phishing.msg");
   await expect(page.locator(".verdict-title")).toHaveText("This email may not be from who it says");
+  await showAdditionalFields(page);
   await expect(page.locator(".reveal-list")).toContainText("invoice.pdf.html");
 
   await page.goto("./?sample=plan.doc");
@@ -3180,6 +3213,7 @@ test("a QR code a PDF draws in boxes, and an Outlook message kept as RTF", async
   await expect(page.locator(".reveal-list")).toContainText("in a code drawn on page 1");
   await page.locator("#picker").setInputFiles(new URL("../../../crates/hexscope-core/tests/fixtures/phishing-rtf.msg", import.meta.url).pathname);
   await expect(page.locator(".verdict-title")).toHaveText("This email may not be from who it says");
+  await showAdditionalFields(page);
   await expect(page.locator(".reveal-list")).toContainText("goes to login.example.info");
 });
 
