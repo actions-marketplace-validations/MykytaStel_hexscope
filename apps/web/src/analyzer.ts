@@ -6,7 +6,7 @@ import { explain } from "./explanations";
 import { Drawer, type CleanResult } from "./drawer";
 import { formatBytes } from "./dom";
 import { HexView } from "./hexview";
-import { Minimap } from "./minimap";
+import type { Minimap, MinimapState } from "./minimap";
 import { Concern, FileModel, Kind } from "./model";
 import { ActionBar } from "./actionbar";
 import { startDemo } from "./demo";
@@ -16,7 +16,7 @@ import { call, onWorkerReset, playerSource } from "./rpc";
 import { verdict } from "./verdict";
 import { headline } from "./headline";
 import { BatchController, BatchView, type BatchAnalysis } from "./batch";
-import { WorkspaceController, type MovieProgress, type WorkspaceLevel } from "./workspace-controller";
+import { WorkspaceController, type AnalysisProgress, type WorkspaceLevel } from "./workspace-controller";
 import { categories } from "./share";
 import { hasCleanableAudioTags } from "./audio-clean";
 import { dismissTour, maybeTour, resetTour } from "./tour";
@@ -34,6 +34,7 @@ withUkrainian(() => import("./docs-i18n"));
 
 let batchController: BatchController;
 let workspace: WorkspaceController;
+let entropyJob: { model: FileModel; controller: AbortController } | null = null;
 
 /** "Take the tour": on the sample photo, from the start. */
 export function startTour(): void {
@@ -69,7 +70,11 @@ readAnnouncement.setAttribute("aria-atomic", "true");
 const cancelRead = document.createElement("button");
 cancelRead.type = "button";
 cancelRead.className = "btn fileinfo-cancel";
-cancelRead.addEventListener("click", () => workspace?.cancelOpen());
+cancelRead.addEventListener("click", () => {
+  const job = entropyJob;
+  if (job && job.model === workspace?.model) job.controller.abort();
+  else workspace?.cancelOpen();
+});
 const appNavigation = $<HTMLElement>("app-nav");
 const comparePicker = $<HTMLInputElement>("compare-picker");
 const noFile = async (): Promise<CleanResult> => ({ copy: new Blob([]), name: "", saved: false, removed: [], orientation: 0, error: "no file is open" });
@@ -141,16 +146,76 @@ const hex = new HexView($("hex-body"), {
     });
   },
 });
-const minimap = new Minimap($("hex-body"), { onJump: (offset) => hex.scrollToOffset(offset) });
+let minimapInstance: Minimap | null = null;
+let minimapLoading: Promise<Minimap> | null = null;
+let minimapModel: FileModel | null = null;
+let minimapState: MinimapState = "ready";
+let view: [number, number] = [0, 0];
+function ensureMinimap(): Promise<Minimap> {
+  if (!minimapLoading) {
+    minimapLoading = import("./minimap").then(({ Minimap }) => {
+      const instance = new Minimap($("hex-body"), {
+        onJump: (offset) => hex.scrollToOffset(offset),
+        onBuild: () => {
+          const model = workspace?.model;
+          if (model) startEntropyMap(model);
+        },
+      });
+      minimapInstance = instance;
+      instance.setModel(minimapModel ?? workspace?.model ?? null);
+      instance.setView(...view);
+      instance.setSelected(selected);
+      instance.setState(minimapState);
+      return instance;
+    });
+  }
+  return minimapLoading;
+}
+const minimap = {
+  setModel(model: FileModel | null) {
+    minimapModel = model;
+    minimapInstance?.setModel(model);
+  },
+  setView(start: number, end: number) {
+    view = [start, end];
+    minimapInstance?.setView(start, end);
+  },
+  setSelected(id: number) {
+    minimapInstance?.setSelected(id);
+  },
+  setState(state: MinimapState) {
+    minimapState = state;
+    minimapInstance?.setState(state);
+  },
+  refresh() {
+    minimapInstance?.refresh();
+  },
+};
 // What the bytes read as, their hashes and their entropy: a module of its
 // own, loaded the first time its panel under the bytes is opened.
 let tools: import("./bytetools").ByteTools | null = null;
-let view: [number, number] = [0, 0];
 const toolsBox = $<HTMLDetailsElement>("hex-tools");
+function toolsAreVisible(): boolean {
+  return toolsBox.open && document.body.dataset.state === "ready" && document.body.dataset.view === "bytes";
+}
 toolsBox.addEventListener("toggle", () => {
-  if (!toolsBox.open || tools) return;
+  if (tools) {
+    tools.setActive(toolsAreVisible());
+    return;
+  }
+  if (!toolsBox.open) return;
   void import("./bytetools").then(({ ByteTools }) => {
-    tools = new ByteTools($("hex-tools-body"), { jump: (offset) => hex.scrollToOffset(offset) });
+    if (tools) {
+      tools.setActive(toolsAreVisible());
+      return;
+    }
+    tools = new ByteTools($("hex-tools-body"), {
+      jump: (offset) => {
+        setStatusOffset(offset);
+        hex.scrollToOffset(offset);
+      },
+    });
+    tools.setActive(toolsAreVisible());
     const m = workspace.model;
     tools.setModel(m);
     tools.setView(...view);
@@ -363,23 +428,31 @@ function setWorkspaceView(view: WorkspaceView, scrollToSection = true, recordHis
   if (view === "map" && details) details.open = true;
   if (selected < 0 && workspace.model) drawer.showNode(workspace.model, selected, false);
   setView(view === "structure" || view === "bytes" ? "bytes" : view === "files" ? "files" : "summary");
+  if (view === "structure" || view === "bytes") void ensureMinimap();
+  tools?.setActive(toolsAreVisible());
   syncAppNavigation();
   if (view === "files") void showFiles();
   else for (const files of filesViews.values()) files.hide();
 
   if (!scrollToSection) return;
   const file = $("drawer").querySelector<HTMLElement>(".drawer-file");
-  const target = view === "metadata"
-    ? $("drawer").querySelector<HTMLElement>(".reveals")
-    : view === "content"
-      ? $("drawer").querySelector<HTMLElement>(contentTargetSelector)
-      : view === "map"
-        ? makeup
-      : null;
+  let target: HTMLElement | null = null;
+  if (view === "metadata") {
+    target = $("drawer").querySelector<HTMLElement>(".reveals");
+  } else if (view === "content") {
+    target = $("drawer").querySelector<HTMLElement>(".overview-flow > .pdf-navigator, .overview-flow > .pdf-navigator-loading")
+      ?? $("drawer").querySelector<HTMLElement>(".overview-flow > .document-map, .overview-flow > .document-map-loading")
+      ?? $("drawer").querySelector<HTMLElement>(contentTargetSelector);
+  } else if (view === "map") {
+    target = makeup
+      ?? $("drawer").querySelector<HTMLElement>(".more-details > .makeup-loading")
+      ?? $("drawer").querySelector<HTMLElement>(".more-details > .heif-map");
+  }
   if (view === "overview" || view === "metadata") {
-    requestAnimationFrame(() => file?.scrollTo({ top: 0, behavior: "smooth" }));
+    requestAnimationFrame(() => file?.scrollTo({ top: 0 }));
   } else if (target) {
-    requestAnimationFrame(() => target.scrollIntoView({ behavior: "smooth", block: "start" }));
+    const destination = target;
+    requestAnimationFrame(() => destination.scrollIntoView({ block: "start" }));
   }
 }
 
@@ -389,6 +462,7 @@ window.addEventListener("popstate", (event: PopStateEvent) => {
   if (state?.hexscopeWorkspace && workspace?.model) {
     document.body.dataset.state = "ready";
     showFileInfo(workspace.model, workspace.levels);
+    startEntropyMap(workspace.model);
     setWorkspaceView(state.hexscopeView ?? "overview", false);
     updateProblems();
     playBtn.hidden = !canPlay();
@@ -397,6 +471,8 @@ window.addEventListener("popstate", (event: PopStateEvent) => {
   if (workspace?.model && document.body.dataset.state === "ready") {
     // The entry before the first inspected file is the landing page. Keep the
     // parsed file in memory so Forward can restore the workspace immediately.
+    stopEntropyMap();
+    tools?.setActive(false);
     document.body.dataset.state = "empty";
     $("fileinfo").replaceChildren();
     locationBtn.hidden = true;
@@ -488,10 +564,12 @@ const drawer = new Drawer(
     toBytes();
     point(id);
   },
-  (start, len) => {
-    if (len <= 0) return;
+  (start, len, selectPart = true) => {
+    const model = workspace.model;
+    if (!model || len <= 0 || start < 0 || start >= model.bytes.length) return;
     toBytes();
-    hex.setHead(start, start + len);
+    if (selectPart) point(model.nodeAt(start), start);
+    hex.setHead(start, Math.min(model.bytes.length, start + len));
     hex.focusAt(start);
     setStatusOffset(start);
   },
@@ -797,57 +875,7 @@ function nextProblem(): void {
 
 function showFileInfo(m: FileModel, levels: readonly WorkspaceLevel[]): void {
   const info = $("fileinfo");
-  const chips: string[] = [];
   const f = m.file;
-  if (f.format === "png" && f.ihdr) {
-    const [w, h, depth, color] = f.ihdr;
-    const names: Record<number, string> = { 0: "Grey", 2: "RGB", 3: "Palette", 4: "Grey+α", 6: "RGBA" };
-    chips.push("PNG", `${w}×${h}`, `${names[color] ?? `type ${color}`} ${depth}-bit`);
-  } else if (f.format === "png") {
-    chips.push("PNG");
-  } else if (f.format === "jpeg") {
-    chips.push("JPEG");
-    if (f.dimensions) chips.push(`${f.dimensions[0]}×${f.dimensions[1]}`);
-    if (f.facts.length > 0 || f.location) chips.push("EXIF");
-  } else if (f.format === "webp" || f.format === "gif") {
-    chips.push(...m.value(0).split(" · "));
-    if (f.facts.length > 0 || f.location) chips.push("Metadata");
-  } else if (f.format === "tiff") {
-    chips.push("TIFF");
-    if (f.dimensions) chips.push(`${f.dimensions[0]}×${f.dimensions[1]}`);
-    if (f.facts.length > 0 || f.location) chips.push("EXIF");
-  } else if (f.format === "heif") {
-    chips.push(m.value(0).split(" · ")[0]);
-    if (f.dimensions) chips.push(`${f.dimensions[0]}×${f.dimensions[1]}`);
-    if (f.facts.length > 0 || f.location) chips.push("EXIF");
-  } else if (f.format === "video") {
-    // "QuickTime · 64×48 · 1.0 s"
-    chips.push(...m.value(0).split(" · "));
-    if (f.location) chips.push("Location");
-  } else if (f.format === "pdf") {
-    // "PDF 1.7 · 12 objects · 2 revisions"
-    chips.push(...m.value(0).split(" · "));
-  } else if (f.format === "zip") {
-    // A document by what it is; an archive by what is in it.
-    const kind = kindOf(m);
-    chips.push(...(kind === "ZIP" ? ["ZIP", m.value(0)] : [kind]));
-  } else if (f.format === "rtf") {
-    chips.push("Rich Text");
-  } else if (f.format === "svg") {
-    chips.push("SVG");
-  } else if (f.format === "office97" || f.format === "cfb") {
-    chips.push(m.value(0).charAt(0).toUpperCase() + m.value(0).slice(1));
-  } else if (f.format === "eml" || f.format === "msg") {
-    chips.push(f.format === "msg" ? "Outlook message" : "Email");
-    if (f.attachments.length > 0) chips.push(f.attachments.length === 1 ? "1 attachment" : `${f.attachments.length} attachments`);
-  } else if (f.format === "wasm") {
-    // "WebAssembly · 82 functions · “hello”"
-    chips.push(...m.value(0).split(" · "));
-  } else {
-    chips.push("Unrecognised format");
-  }
-  chips.push(formatBytes(m.bytes.length), `parsed in ${f.parseMs.toFixed(1)} ms`);
-
   // The way back up: the list of files, each archive above this document, then this one.
   // The page's heading while a file is open: its name, and the way to it.
   const name = document.createElement("h1");
@@ -886,19 +914,20 @@ function showFileInfo(m: FileModel, levels: readonly WorkspaceLevel[]): void {
   const full = document.createElement("span");
   full.className = "meta-full";
   // Each its own text, so each is translated on its own: "parsed in 2 ms" is not a whole line.
-  full.replaceChildren(...chips.flatMap((chip, i) => (i > 0 ? [document.createTextNode("  ·  "), chipText(chip)] : [chipText(chip)])));
   meta.append(plain, full);
   info.replaceChildren(name, meta);
+  void import("./result-navigation")
+    .then(({ coverageStatusButton, fillFileInfoChips }) => {
+      if (!name.isConnected) return;
+      fillFileInfoChips(full, m);
+      info.append(coverageStatusButton(m, appNavigation, $("drawer")));
+    }, () => {
+      // The detailed coverage explanation remains visible in the result even if this small header control cannot load.
+    });
 
   // A location is not damage, so it gets its own badge rather than joining
   // the problems count — but it is the first thing a person should see.
   locationBtn.hidden = !f.location;
-}
-
-function chipText(text: string): HTMLSpanElement {
-  const span = document.createElement("span");
-  span.textContent = text;
-  return span;
 }
 
 workspace = new WorkspaceController({
@@ -934,9 +963,10 @@ workspace = new WorkspaceController({
     loading(name) {
       document.body.dataset.state = "loading";
       $("fileinfo").textContent = `Parsing ${name}…`;
+      readAnnouncement.dataset.key = "";
       $("load-error").hidden = true;
     },
-    progress: showMovieProgress,
+    progress: showAnalysisProgress,
     show: renderFile,
     select,
     failed: loadFailed,
@@ -946,6 +976,7 @@ workspace = new WorkspaceController({
       showFileInfo(model, levels);
       readAnnouncement.textContent = translateText("Reading was cancelled.", currentLocale());
       $("fileinfo").append(readAnnouncement);
+      startEntropyMap(model);
     },
     note: (message) => drawer.showNote(message),
     remember,
@@ -959,30 +990,53 @@ workspace = new WorkspaceController({
         }, 350);
       }
     },
-    clearPlayer: closePlayer,
+    clearPlayer() {
+      stopEntropyMap();
+      tools?.setActive(false);
+      closePlayer();
+    },
   },
 });
 
-function showMovieProgress(progress: MovieProgress): void {
+function showAnalysisProgress(progress: AnalysisProgress): void {
   const locale = currentLocale();
-  const phase = {
-    scan: "structure",
-    ranges: "metadata",
-    entropy: "byte map",
-  } as const;
+  const video = progress.scope === "video";
   const percentage = Math.min(100, Math.floor((progress.loaded / Math.max(1, progress.total)) * 100));
-  const label = progress.stage === "parse"
+  const videoPhase = progress.stage === "scan"
+    ? "structure"
+    : progress.stage === "ranges"
+      ? "metadata"
+      : progress.stage === "entropy"
+        ? "byte map"
+        : null;
+  const label = video && progress.stage === "parse"
     ? "Parsing video metadata…"
-    : `Reading video ${phase[progress.stage]}: ${percentage}%`;
+    : video && videoPhase
+      ? `Reading video ${videoPhase}: ${percentage}%`
+      : progress.stage === "read"
+        ? `Reading file: ${percentage}%`
+        : progress.stage === "load"
+          ? "Loading format reader…"
+          : progress.stage === "parse"
+            ? "Analyzing file structure…"
+            : progress.stage === "entropy"
+              ? `Building byte map: ${percentage}%`
+              : "Preparing findings…";
   const localizedLabel = translateText(label, locale);
   readProgress.textContent = localizedLabel;
-  readProgress.setAttribute("aria-label", translateText("Video read progress", locale));
+  readProgress.setAttribute("aria-label", translateText(video ? "Video read progress" : "File analysis progress", locale));
   readProgress.setAttribute("aria-valuetext", localizedLabel);
-  if (progress.stage === "parse") readProgress.removeAttribute("aria-valuenow");
-  else readProgress.setAttribute("aria-valuenow", String(percentage));
-  const announcementKey = progress.stage === "parse"
-    ? `${locale}:${progress.stage}`
-    : `${locale}:${progress.stage}:${Math.floor(percentage / 10) * 10}`;
+  const measured = progress.stage === "read" || progress.stage === "scan" || progress.stage === "ranges" || progress.stage === "entropy";
+  if (measured) {
+    readProgress.style.setProperty("--read-progress", `${percentage}%`);
+    readProgress.setAttribute("aria-valuenow", String(percentage));
+  } else {
+    readProgress.style.removeProperty("--read-progress");
+    readProgress.removeAttribute("aria-valuenow");
+  }
+  const announcementKey = measured
+    ? `${locale}:${progress.stage}:${Math.floor(percentage / 10) * 10}`
+    : `${locale}:${progress.stage}`;
   if (readAnnouncement.dataset.key !== announcementKey) {
     readAnnouncement.dataset.key = announcementKey;
     readAnnouncement.textContent = localizedLabel;
@@ -993,6 +1047,52 @@ function showMovieProgress(progress: MovieProgress): void {
   if (readProgress.parentElement !== fileinfo || readAnnouncement.parentElement !== fileinfo || cancelRead.parentElement !== fileinfo) {
     fileinfo.replaceChildren(readProgress, readAnnouncement, cancelRead);
   }
+}
+
+function stopEntropyMap(): void {
+  const job = entropyJob;
+  entropyJob = null;
+  job?.controller.abort();
+}
+
+function startEntropyMap(model: FileModel): void {
+  if (model.bytes.length === 0 || model.file.entropy.length > 0) {
+    minimap.setState("ready");
+    return;
+  }
+  if (entropyJob?.model === model) return;
+  stopEntropyMap();
+
+  const controller = new AbortController();
+  const job = { model, controller };
+  entropyJob = job;
+  minimap.setState("building");
+  const isCurrent = () => entropyJob === job && workspace?.model === model;
+
+  void import("./browser-entropy").then(({ browserEntropy, DEFAULT_ENTROPY_BINS }) => browserEntropy(model.bytes, DEFAULT_ENTROPY_BINS, {
+    signal: controller.signal,
+    onProgress(loaded, total) {
+      if (isCurrent()) showAnalysisProgress({ stage: "entropy", loaded, total, cancellable: true });
+    },
+  })).then((result) => {
+    if (!isCurrent() || controller.signal.aborted) return;
+    model.file.entropy = result.values;
+    model.file.entropyWindow = result.window;
+    minimap.setState("ready");
+    minimap.refresh();
+  }).catch(() => {
+    if (!isCurrent()) return;
+    minimap.setState(controller.signal.aborted ? "cancelled" : "failed");
+  }).finally(() => {
+    if (entropyJob !== job) return;
+    entropyJob = null;
+    if (workspace?.model !== model || document.body.dataset.state !== "ready") return;
+    showFileInfo(model, workspace.levels);
+    if (controller.signal.aborted) {
+      readAnnouncement.textContent = translateText("Byte map calculation was cancelled.", currentLocale());
+      $("fileinfo").append(readAnnouncement);
+    }
+  });
 }
 
 onWorkerReset(() => {
@@ -1039,6 +1139,8 @@ function startBatch(files: File[]): void {
 function showBatch(): void {
   const items = batchController.items;
   if (!items) return;
+  stopEntropyMap();
+  tools?.setActive(false);
   closePlayer();
   document.body.dataset.state = "batch";
   $("fileinfo").textContent = `${items.length} files`;
@@ -1132,6 +1234,7 @@ function renderFile(m: FileModel, levels: readonly WorkspaceLevel[]): void {
     },
     () => {},
   );
+  startEntropyMap(m);
 }
 
 /** QR codes, looked for once the file is on screen: its card is drawn again with what they say. */

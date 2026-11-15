@@ -11,6 +11,80 @@ change what the CLI's JSON says. How a version is made: [docs/releasing.md](docs
 What is merged but not released yet is in [`changes/`](changes/), with one
 file per change; `node scripts/changelog.mjs` shows how it will read here.
 
+## [0.22.0] — 2026-11-15
+
+### Changed
+
+- **See the read status beside the file name.** The header distinguishes a
+  complete supported-format read, a partial check and a file with no format
+  parser. Select the status to jump to the explanation and any unchecked
+  areas.
+- **Scan findings by what to do next.** The summary separates issues to check
+  before opening or sharing, personal information, and coverage or format
+  notes. A compact index jumps between groups. Incomplete checks open on their
+  unchecked evidence, and new asynchronous findings appear in the right group.
+  Each finding still leads to its source in the structure or bytes.
+- **Read format inspectors as one result screen.** Metadata, document maps,
+  PDF tools, photo scan clues, HEIF/AVIF maps and technical details now share
+  a card hierarchy, spacing scale and responsive layout while keeping their
+  format-specific controls.
+- **Make the Content view show file content.** PDF page navigation, office
+  document maps and visual photo-scan clues stay available in that view, and
+  navigation scrolls directly to the relevant inspector while it loads. Map
+  view similarly targets its loading or ready file map.
+- **Make evidence filtering easier to trust and use.** Category counts include
+  the file properties they represent, empty filters cannot be selected, and
+  screen readers hear how many results remain after a search or filter change.
+- **Keep byte evidence reachable on phones.** Following a finding to a byte
+  range selects its containing part as well as the range, so the mobile
+  inspector opens with the matching file context.
+- **Keep clean-copy focus on the result.** The primary action reports its
+  in-progress state, respects reduced motion, and moves keyboard focus to the
+  completed result or retry action when it finishes. Workspace navigation
+  also skips animated scrolling when reduced motion is enabled.
+
+## [0.21.0] — 2026-11-15
+
+### Changed
+
+- **See file analysis move through clear stages.** The browser reports progress
+  while it reads a file in bounded chunks, loads its format reader, analyzes its
+  structure and prepares findings. Reading can be cancelled between chunks,
+  and a pending reader load can be stopped before parsing starts. The cancel
+  control is disabled during synchronous WebAssembly work that cannot safely
+  receive a stop request. Existing file-size limits, local-only processing and
+  partial-read labels are unchanged.
+- **See findings before the byte map is ready.** For ordinary full-file inputs,
+  the parsed findings appear first while the browser builds the entropy map in
+  short idle slices. Map progress is visible, and the work can be cancelled and
+  restarted without reopening the file. Large movies retain their existing
+  range-based reader and progress stages.
+- **Keep the optional entropy inspector responsive.** Its 400-region overview
+  now computes in short background slices, preserves the previous bounded
+  samples, and exposes progress, cancel and retry. The graph can be explored
+  with keyboard arrows, Home, End and Page Up/Down, with the current byte and
+  entropy value announced to assistive technology. Closing the panel or leaving
+  Bytes stops computation; returning starts a fresh calculation.
+- **Navigate the main file map without a pointer.** The whole-file scrollbar
+  now responds to arrow keys, Page Up/Down, Home and End and announces its
+  current byte offset.
+
+### Fixed
+
+- **Warm optional document readers after opening a photo.** The worker now
+  decides whether to prefetch them before transferring the input bytes to the
+  page, so the check still sees the original file data.
+
+## [0.20.0] — 2026-11-15
+
+### Changed
+
+- **PNG, PDF and ZIP analysis spend less time on compressed data.** On local
+  native synthetic benchmarks versus 0.19.0, a 10.3 MB PNG read improved by
+  about 41%, a PDF with 4 MiB of compressed XMP by 50%, and extracting plus
+  verifying a 10 MiB ZIP member by 74%. These measurements do not establish
+  gains on physical phones or every format.
+
 ## [0.19.0] — 2026-11-11
 
 ### Added
@@ -954,7 +1028,10 @@ photos, videos, PDFs, Office documents, emails, archives and WebAssembly in
 the browser; says what each gives away; makes clean, redacted and repaired
 copies; and a CLI and GitHub Action for the same checks in CI.
 
-[Unreleased]: https://github.com/MykytaStel/hexscope/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/MykytaStel/hexscope/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/MykytaStel/hexscope/compare/v0.21.0...v0.22.0
+[0.21.0]: https://github.com/MykytaStel/hexscope/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/MykytaStel/hexscope/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/MykytaStel/hexscope/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/MykytaStel/hexscope/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/MykytaStel/hexscope/compare/v0.16.0...v0.17.0
