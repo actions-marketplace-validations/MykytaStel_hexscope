@@ -9,7 +9,6 @@ import { HexView } from "./hexview";
 import type { Minimap, MinimapState } from "./minimap";
 import { Concern, FileModel, Kind } from "./model";
 import { ActionBar } from "./actionbar";
-import { startDemo } from "./demo";
 import { PictureView } from "./pixels";
 import { TreeView } from "./tree";
 import { call, onWorkerReset, playerSource } from "./rpc";
@@ -25,7 +24,7 @@ import { announce } from "./announce";
 import { recentFiles, remember } from "./recent";
 import { MAX_FILE, cleanName, kindOf, kindWord, phoneCanShare, repairedName, saveAs, siteUrl, tooLarge } from "./files";
 import { cleanCopy, redactCopy, repairCopy } from "./copies";
-import { showLegend } from "./legend";
+import { createEvidenceNavigation } from "./evidence-navigation";
 import { currentLocale, loadUkrainian, translateText, withUkrainian } from "./i18n";
 
 // What each part of a file is, in Ukrainian, for the Structure and Bytes
@@ -36,11 +35,18 @@ let batchController: BatchController;
 let workspace: WorkspaceController;
 let entropyJob: { model: FileModel; controller: AbortController } | null = null;
 
-/** "Take the tour": on the sample photo, from the start. */
-export function startTour(): void {
+function showByteLegend(model: FileModel): void {
+  void import("./legend").then(({ showLegend }) => {
+    if (workspace?.model === model) showLegend($("hex-legend"), model, point);
+  });
+}
+
+/** "Take the tour": reopen the sample, then start its notes on request. */
+export async function startTour(): Promise<void> {
   resetTour();
   batchController.clear();
-  void loadSample("samples/photo.jpg", "photo.jpg");
+  await loadSample("samples/photo.jpg", "photo.jpg");
+  maybeTour();
 }
 
 // On a phone, what to do about the file stays at hand.
@@ -261,14 +267,22 @@ const picture = new PictureView({
 // tap away, and anything that points into the bytes goes there.
 const narrow = matchMedia("(max-width: 900px)");
 
-// File views stay at the top level. Technical inspection is grouped with
-// tools on a phone and gets its own section on wider screens.
+// The everyday views stay at the top level. The map and byte-level views live
+// under More on a phone, and in their own Inspect group on a wider screen.
 const expertGroup = appNavigation.querySelector<HTMLElement>(".app-nav-inspection")!;
 const moreViews = appNavigation.querySelector<HTMLElement>(".app-nav-more-actions")!;
 const moreMenu = appNavigation.querySelector<HTMLDetailsElement>(".app-nav-more")!;
+const primaryViews = appNavigation.querySelector<HTMLElement>(".app-nav-primary")!;
+const mapView = primaryViews.querySelector<HTMLElement>('[data-app-view="map"]')!;
+const filesView = primaryViews.querySelector<HTMLElement>('[data-app-view="files"]')!;
 function placeExpertViews(): void {
-  if (narrow.matches) moreViews.prepend(expertGroup);
-  else appNavigation.insertBefore(expertGroup, moreMenu);
+  if (narrow.matches) {
+    expertGroup.prepend(mapView);
+    moreViews.prepend(expertGroup);
+  } else {
+    primaryViews.insertBefore(mapView, filesView);
+    appNavigation.insertBefore(expertGroup, moreMenu);
+  }
 }
 placeExpertViews();
 narrow.addEventListener("change", placeExpertViews);
@@ -289,6 +303,9 @@ function setView(view: "summary" | "bytes" | "files"): void {
 }
 
 type WorkspaceView = "overview" | "metadata" | "content" | "map" | "files" | "structure" | "bytes";
+type EvidenceNavigation = import("./evidence-navigation").EvidenceNavigation;
+type EvidenceReturnPosition = import("./evidence-navigation").EvidenceReturnPosition;
+let evidenceNavigation: EvidenceNavigation | null = null;
 
 /** A ZIP that is only an archive: Office documents, books and apps have their own views. */
 const archives = new WeakMap<FileModel, boolean>();
@@ -421,18 +438,35 @@ function writeWorkspaceHistory(view: WorkspaceView, replace = false): void {
 }
 
 function setWorkspaceView(view: WorkspaceView, scrollToSection = true, recordHistory = false): void {
+  const returning: EvidenceReturnPosition | null = evidenceNavigation?.takeReturn(workspace?.model ?? null, view) ?? null;
   document.body.dataset.appView = view;
   if (recordHistory) writeWorkspaceHistory(view, true);
   const makeup = $("drawer").querySelector<HTMLElement>(".more-details > .makeup");
   const details = $("drawer").querySelector<HTMLDetailsElement>(".more-details");
   if (view === "map" && details) details.open = true;
+  if (view === "metadata") {
+    const evidence = $("drawer").querySelector<HTMLDetailsElement>(".evidence-tools");
+    if (evidence) evidence.open = true;
+  }
   if (selected < 0 && workspace.model) drawer.showNode(workspace.model, selected, false);
   setView(view === "structure" || view === "bytes" ? "bytes" : view === "files" ? "files" : "summary");
-  if (view === "structure" || view === "bytes") void ensureMinimap();
+  if (view === "structure" || view === "bytes") {
+    void ensureMinimap();
+    if (workspace?.model) showByteLegend(workspace.model);
+  }
   tools?.setActive(toolsAreVisible());
   syncAppNavigation();
   if (view === "files") void showFiles();
   else for (const files of filesViews.values()) files.hide();
+
+  if (returning) {
+    requestAnimationFrame(() => {
+      const file = $("drawer").querySelector<HTMLElement>(".drawer-file");
+      file?.scrollTo({ top: returning.scrollTop });
+      if (returning.focusTarget?.isConnected) returning.focusTarget.focus({ preventScroll: true });
+    });
+    return;
+  }
 
   if (!scrollToSection) return;
   const file = $("drawer").querySelector<HTMLElement>(".drawer-file");
@@ -472,14 +506,16 @@ window.addEventListener("popstate", (event: PopStateEvent) => {
     // The entry before the first inspected file is the landing page. Keep the
     // parsed file in memory so Forward can restore the workspace immediately.
     stopEntropyMap();
+    clearEvidenceReturnContext();
     tools?.setActive(false);
     document.body.dataset.state = "empty";
+    document.querySelector<HTMLElement>(".empty")!.scrollTop = 0;
+    document.body.dataset.heroButton = "shown";
     $("fileinfo").replaceChildren();
     locationBtn.hidden = true;
     problemsBtn.hidden = true;
     playBtn.hidden = true;
     syncAppNavigation();
-    void startDemo($("demo"));
   }
 });
 
@@ -497,7 +533,6 @@ appNavigation.addEventListener("click", (event) => {
     const sameView = nextView === document.body.dataset.appView;
     const playerOpen = playerPending || document.body.classList.contains("is-playing");
     if (playerOpen) closePlayer();
-    tourDismissedByNavigation = true;
     dismissTour();
     // Close an open player, but don't reapply the active page's layout or scroll.
     if (sameView) return;
@@ -507,7 +542,6 @@ appNavigation.addEventListener("click", (event) => {
     setWorkspaceView(nextView, true, true);
     return;
   }
-  tourDismissedByNavigation = true;
   dismissTour();
   if (button.dataset.appAction === "compression") {
     if (playerPending || player?.isOpen) closePlayer();
@@ -531,7 +565,6 @@ comparePicker.addEventListener("change", () => {
   }
 });
 
-let tourDismissedByNavigation = false;
 /** The view a file opens on: a phone always starts on the summary. */
 function openingView(): "summary" | "bytes" {
   return narrow.matches ? "summary" : wideView();
@@ -542,7 +575,6 @@ function toBytes(): void {
 for (const b of document.querySelectorAll<HTMLButtonElement>("#viewswitch button")) {
   b.addEventListener("click", () => {
     const view = b.dataset.view === "bytes" ? "bytes" : "summary";
-    tourDismissedByNavigation = true;
     dismissTour();
     setWorkspaceView(view === "bytes" ? "bytes" : "overview", false);
     // On a wide screen the choice is remembered for the next file.
@@ -560,18 +592,17 @@ setView("summary");
 
 const drawer = new Drawer(
   $("drawer"),
-  (id) => {
-    toBytes();
-    point(id);
-  },
+  (id) => followEvidenceSource(id),
   (start, len, selectPart = true) => {
     const model = workspace.model;
     if (!model || len <= 0 || start < 0 || start >= model.bytes.length) return;
+    evidenceNavigation?.remember(model);
     toBytes();
     if (selectPart) point(model.nodeAt(start), start);
     hex.setHead(start, Math.min(model.bytes.length, start + len));
     hex.focusAt(start);
     setStatusOffset(start);
+    if (selectPart) requestAnimationFrame(() => drawer.focusEvidenceReturn());
   },
   (entry) => void openPlayer(entry),
   (entry) => void openEntry(entry),
@@ -596,6 +627,28 @@ const drawer = new Drawer(
   },
   (m) => picture.element(m),
 );
+
+evidenceNavigation = createEvidenceNavigation(
+  drawer,
+  $("drawer"),
+  appNavigation,
+  () => workspace?.model ?? null,
+  () => document.body.dataset.appView ?? "",
+  (view, scroll, history) => setWorkspaceView(view, scroll, history),
+  toBytes,
+  point,
+);
+
+/** Removes a temporary return route when its file or workspace has changed. */
+function clearEvidenceReturnContext(): void {
+  evidenceNavigation?.clear();
+  delete appNavigation.dataset.inspectorRequested;
+}
+
+/** Opens the selected finding in Bytes and exposes its one-step route back. */
+function followEvidenceSource(id: number): void {
+  evidenceNavigation?.followSource(id, workspace?.model ?? null);
+}
 
 /** Compares the file on screen with another, parsed aside. */
 async function compareWith(other: File): Promise<void> {
@@ -735,6 +788,7 @@ async function openPlayer(entry = selectedEntry(), step?: number): Promise<Defla
   if (!model) return null;
   const isZip = model.file.format === "zip";
   if (isZip ? entry < 0 || !model.entry(entry).playable : !model.playable) return null;
+  dismissTour();
   clearPlayerLoadError();
   if (isZip) closePlayer();
   const request = ++playerRequest;
@@ -983,12 +1037,7 @@ workspace = new WorkspaceController({
     afterOpen(model) {
       arrive();
       if (followLink(model)) return;
-      // Only a standalone file gets the first-open tour; nested entries do not.
-      if (model.source) {
-        setTimeout(() => {
-          if (!tourDismissedByNavigation && document.body.dataset.view === "summary") maybeTour();
-        }, 350);
-      }
+      // Opening a file shows its result directly; the tour is an explicit choice in the footer.
     },
     clearPlayer() {
       stopEntropyMap();
@@ -1139,6 +1188,7 @@ function startBatch(files: File[]): void {
 function showBatch(): void {
   const items = batchController.items;
   if (!items) return;
+  clearEvidenceReturnContext();
   stopEntropyMap();
   tools?.setActive(false);
   closePlayer();
@@ -1192,11 +1242,11 @@ async function analyzeBatchFile(file: File, signal: AbortSignal, profile?: Publi
 
 /** Puts a document on screen, with nothing selected. */
 function renderFile(m: FileModel, levels: readonly WorkspaceLevel[]): void {
+  clearEvidenceReturnContext();
   clearPlayerLoadError();
   hover = -1;
   selected = -1;
   problemCursor = -1;
-  tourDismissedByNavigation = false;
   setStatusOffset(-1);
   document.body.dataset.state = "ready";
   drawer.nested = levels.length;
@@ -1210,7 +1260,6 @@ function renderFile(m: FileModel, levels: readonly WorkspaceLevel[]): void {
 
   hex.setModel(m);
   tools?.setModel(m);
-  showLegend($("hex-legend"), m, point);
   search.reset();
   minimap.setModel(m);
   tree.setModel(m);
@@ -1279,8 +1328,8 @@ function openEntry(entry: number): void {
 }
 
 export async function loadSample(path: string, name: string): Promise<void> {
-  // Loading from the moment it is asked for: the landing demo shares the
-  // worker, and must not parse its own file over this one.
+  // Load only the sample the person chose; opening the landing page itself
+  // does not start file parsing.
   document.body.dataset.state = "loading";
   $("fileinfo").textContent = `Opening ${name}…`;
   let res: Response | null = null;
@@ -1323,8 +1372,6 @@ export function loadFailed(message: string): void {
   const landing = $("load-error");
   landing.textContent = message;
   landing.hidden = !!model;
-  // An empty page shows the demo again.
-  if (!model) setTimeout(() => void startDemo($("demo")), 0);
 }
 
 /** Opens the sample a button names. */
@@ -1348,7 +1395,6 @@ function followLink(model: FileModel): boolean {
   if (!asked || (!asked.view && !asked.part)) return false;
   const part = asked.part?.toLowerCase();
   const id = part ? model.file.labels.findIndex((label) => label.toLowerCase() === part) : -1;
-  tourDismissedByNavigation = true;
   setWorkspaceView(asked.view ?? (id > 0 ? "bytes" : "overview"));
   if (id > 0) select(id);
   return true;
